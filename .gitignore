@@ -1,0 +1,6 @@
+/target/
+*.aup
+*.key
+/release-keys/
+*.swp
+*.tmp
