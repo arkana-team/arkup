@@ -832,6 +832,64 @@ mod tests {
     }
 
     #[test]
+    fn apply_replaces_final_symlink_without_writing_through_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside-file");
+        let key_dir = temp.path().join("keys");
+        let package = temp.path().join("system.aup");
+        fs::create_dir_all(source.join("usr/bin")).unwrap();
+        fs::create_dir_all(root.join("usr/bin")).unwrap();
+        fs::create_dir_all(root.join("etc/arkup/trustedkeys.d")).unwrap();
+        fs::write(source.join("usr/bin/tool"), b"updated system file").unwrap();
+        fs::write(&outside, b"outside file must stay unchanged").unwrap();
+        symlink(&outside, root.join("usr/bin/tool")).unwrap();
+        let (id, signing_key, public_key) = generate_keypair(&key_dir).unwrap();
+        create_pack(&PackOptions {
+            source,
+            deletions: Vec::new(),
+            name: "arkanaos-system".into(),
+            version: "arkanaOS 1.0 (alpha 1) build 1".into(),
+            sequence: 1,
+            architecture: "any".into(),
+            description: "replace a symlink safely".into(),
+            signing_key,
+            output: package.clone(),
+        })
+        .unwrap();
+        fs::copy(
+            public_key,
+            root.join(format!("etc/arkup/trustedkeys.d/{id}.pub")),
+        )
+        .unwrap();
+
+        apply(&ApplyOptions {
+            archive: package,
+            root: root.clone(),
+            supplied_key: None,
+            architecture: Some("x86_64".into()),
+            allow_downgrade: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            b"outside file must stay unchanged"
+        );
+        assert_eq!(
+            fs::read(root.join("usr/bin/tool")).unwrap(),
+            b"updated system file"
+        );
+        assert!(
+            fs::symlink_metadata(root.join("usr/bin/tool"))
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+    }
+
+    #[test]
     fn apply_rejects_wrong_architecture_before_creating_state() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
