@@ -35,6 +35,9 @@ enum Command {
         /// Remove an existing path as part of the update; may be repeated.
         #[arg(long = "delete")]
         deletions: Vec<String>,
+        /// Treat this exact path as system-managed rather than local config; may be repeated.
+        #[arg(long = "system-file")]
+        system_files: Vec<String>,
         #[arg(long)]
         name: String,
         #[arg(long)]
@@ -103,6 +106,7 @@ fn run() -> Result<()> {
         Command::Pack {
             source,
             deletions,
+            system_files,
             name,
             version,
             sequence,
@@ -114,6 +118,7 @@ fn run() -> Result<()> {
             let manifest = create_pack(&PackOptions {
                 source,
                 deletions,
+                system_files,
                 name,
                 version,
                 sequence,

@@ -712,10 +712,13 @@ mod tests {
         fs::create_dir_all(root.join("etc")).unwrap();
         fs::write(source.join("etc/arkana.conf"), b"new=1\n").unwrap();
         fs::write(root.join("etc/arkana.conf"), b"local=1\n").unwrap();
+        fs::write(source.join("etc/os-release"), b"VERSION=2\n").unwrap();
+        fs::write(root.join("etc/os-release"), b"VERSION=1\n").unwrap();
         let (key_id, _, public_key) = generate_keypair(&key_dir).unwrap();
         create_pack(&PackOptions {
             source,
             deletions: Vec::new(),
+            system_files: vec!["etc/os-release".into()],
             name: "arkanaos-system".into(),
             version: "arkanaOS 1.0 (alpha 1) build 10".into(),
             sequence: 10,
@@ -749,6 +752,11 @@ mod tests {
             fs::read(root.join("etc/arkana.conf.arkup-new")).unwrap(),
             b"new=1\n"
         );
+        assert_eq!(
+            fs::read(root.join("etc/os-release")).unwrap(),
+            b"VERSION=2\n"
+        );
+        assert!(!root.join("etc/os-release.arkup-new").exists());
         let record = root.join("var/lib/arkup/installed/arkanaos-system.json");
         assert!(record.exists());
     }
@@ -768,6 +776,7 @@ mod tests {
         create_pack(&PackOptions {
             source: source.clone(),
             deletions: Vec::new(),
+            system_files: Vec::new(),
             name: "arkanaos-system".into(),
             version: "1.0.1".into(),
             sequence: 1,
@@ -799,6 +808,7 @@ mod tests {
         create_pack(&PackOptions {
             source,
             deletions: Vec::new(),
+            system_files: Vec::new(),
             name: "arkanaos-system".into(),
             version: "1.0.2".into(),
             sequence: 2,
@@ -849,6 +859,7 @@ mod tests {
         create_pack(&PackOptions {
             source,
             deletions: Vec::new(),
+            system_files: Vec::new(),
             name: "arkanaos-system".into(),
             version: "arkanaOS 1.0 (alpha 1) build 1".into(),
             sequence: 1,
@@ -903,6 +914,7 @@ mod tests {
         create_pack(&PackOptions {
             source,
             deletions: Vec::new(),
+            system_files: Vec::new(),
             name: "arkanaos-system".into(),
             version: "1.0.1".into(),
             sequence: 1,
@@ -948,6 +960,7 @@ mod tests {
         create_pack(&PackOptions {
             source,
             deletions: Vec::new(),
+            system_files: Vec::new(),
             name: "arkanaos-system".into(),
             version: "1.0.1".into(),
             sequence: 1,
@@ -980,6 +993,7 @@ mod tests {
                 "etc/unchanged.conf".into(),
                 "usr/bin/obsolete".into(),
             ],
+            system_files: Vec::new(),
             name: "arkanaos-system".into(),
             version: "1.0.2".into(),
             sequence: 2,
