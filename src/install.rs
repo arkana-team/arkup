@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::symlink;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
@@ -41,7 +41,12 @@ struct InstalledRecord {
 
 struct AppliedChange {
     destination: PathBuf,
-    backup: Option<PathBuf>,
+    backup: Option<Snapshot>,
+}
+
+struct Snapshot {
+    path: PathBuf,
+    metadata: fs::Metadata,
 }
 
 pub fn apply(options: &ApplyOptions) -> Result<UpdateManifest> {
@@ -465,8 +470,8 @@ fn snapshot_existing(
     destination: &Path,
     relative: &str,
     backup_root: &Path,
-) -> Result<Option<PathBuf>> {
-    let Some(metadata) = existing_metadata(destination)? else {
+) -> Result<Option<Snapshot>> {
+    let Some(mut metadata) = existing_metadata(destination)? else {
         return Ok(None);
     };
     let backup = backup_root.join(relative);
@@ -481,14 +486,26 @@ fn snapshot_existing(
     if metadata.file_type().is_symlink() {
         symlink(fs::read_link(destination)?, &backup)?;
     } else {
-        fs::copy(destination, &backup)?;
-        fs::set_permissions(
-            &backup,
-            fs::Permissions::from_mode(metadata.permissions().mode()),
-        )?;
-        File::open(&backup)?.sync_all()?;
+        let mut source = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(destination)?;
+        // Save ownership and mode from the same inode as the backed-up bytes.
+        metadata = source.metadata()?;
+        ensure!(metadata.is_file(), "backup source must be a regular file");
+        let mut saved = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&backup)?;
+        io::copy(&mut source, &mut saved)?;
+        saved.set_permissions(metadata.permissions())?;
+        saved.sync_all()?;
     }
-    Ok(Some(backup))
+    Ok(Some(Snapshot {
+        path: backup,
+        metadata,
+    }))
 }
 
 fn write_record(
@@ -560,20 +577,21 @@ fn restore_change(change: &AppliedChange) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
     if let Some(backup) = &change.backup {
-        let metadata = fs::symlink_metadata(backup)?;
+        let metadata = &backup.metadata;
         if metadata.file_type().is_symlink() {
-            symlink(fs::read_link(backup)?, &change.destination)?;
+            symlink(fs::read_link(&backup.path)?, &change.destination)?;
         } else {
             let parent = change
                 .destination
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("restore destination has no parent"))?;
-            let staged = NamedTempFile::new_in(parent)?;
-            fs::copy(backup, staged.path())?;
-            fs::set_permissions(
-                staged.path(),
-                fs::Permissions::from_mode(metadata.permissions().mode()),
-            )?;
+            let mut staged = NamedTempFile::new_in(parent)?;
+            io::copy(&mut File::open(&backup.path)?, staged.as_file_mut())?;
+            // Keep the temporary file private until ownership is restored.
+            // chown can clear setuid/setgid bits, so apply the saved mode last.
+            fchown(staged.as_file(), Some(metadata.uid()), Some(metadata.gid()))
+                .context("cannot restore ownership")?;
+            staged.as_file().set_permissions(metadata.permissions())?;
             staged
                 .persist(&change.destination)
                 .map_err(|error| error.error)?;
@@ -755,6 +773,17 @@ mod tests {
 
     #[test]
     fn failed_update_restores_files_and_rejects_replay() {
+        check_failed_update_restores_files(None);
+    }
+
+    #[test]
+    #[ignore = "requires root to create a file owned by another user and group"]
+    fn failed_update_restores_unprivileged_file_ownership() {
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+        check_failed_update_restores_files(Some((65534, 65533)));
+    }
+
+    fn check_failed_update_restores_files(owner: Option<(u32, u32)>) {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         let root = temp.path().join("root");
@@ -793,6 +822,16 @@ mod tests {
         apply(&options(package1.clone())).unwrap();
         assert!(apply(&options(package1)).is_err());
 
+        let destination = root.join("usr/bin/a-tool");
+        let original = File::open(&destination).unwrap();
+        if let Some((uid, gid)) = owner {
+            std::os::unix::fs::fchown(&original, Some(uid), Some(gid)).unwrap();
+        }
+        original
+            .set_permissions(fs::Permissions::from_mode(0o6755))
+            .unwrap();
+        let original_metadata = original.metadata().unwrap();
+
         fs::write(source.join("usr/bin/a-tool"), b"version two").unwrap();
         fs::write(source.join("usr/bin/z-blocked"), b"blocked file").unwrap();
         fs::create_dir(root.join("usr/bin/z-blocked")).unwrap();
@@ -808,11 +847,20 @@ mod tests {
             output: package2.clone(),
         })
         .unwrap();
-        assert!(apply(&options(package2)).is_err());
+        let error = apply(&options(package2)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("all changed files were rolled back")
+        );
         assert_eq!(
             fs::read(root.join("usr/bin/a-tool")).unwrap(),
             b"version one"
         );
+        let restored = fs::metadata(&destination).unwrap();
+        assert_eq!(restored.uid(), original_metadata.uid());
+        assert_eq!(restored.gid(), original_metadata.gid());
+        assert_eq!(restored.permissions().mode() & 0o7777, 0o6755);
         let record: InstalledRecord = serde_json::from_slice(
             &fs::read(root.join("var/lib/arkup/installed/arkanaos-system.json")).unwrap(),
         )
