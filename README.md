@@ -53,6 +53,10 @@ For a test root, pass `--root /path/to/root` to `trust`, `verify`, `list`, or
 trust store. Applying an older sequence requires the explicit
 `--allow-downgrade` option.
 
+Trust import requires directory ancestry owned by root or the invoking user,
+without group or other write access. Sticky directories above the target root
+(such as `/tmp`) are allowed.
+
 ## Pack format and safety
 
 Each pack contains `arkup.json`, `arkup.sig`, and `payload/` files. The Ed25519
