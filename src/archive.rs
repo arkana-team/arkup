@@ -1,7 +1,8 @@
 use crate::key;
 use crate::manifest::{
-    EntryKind, MAX_MANIFEST_BYTES, MAX_PACKAGE_BYTES, UpdateEntry, UpdateManifest,
-    is_protected_path, safe_symlink_target, valid_atom, valid_name, valid_version, validate_path,
+    EntryKind, MAX_MANIFEST_BYTES, MAX_MANIFEST_ENTRIES, MAX_PACKAGE_BYTES, UpdateEntry,
+    UpdateManifest, is_protected_path, safe_symlink_target, valid_atom, valid_name, valid_version,
+    validate_path,
 };
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
@@ -24,6 +25,16 @@ const SIGNATURE_NAME: &str = "arkup.sig";
 const PAYLOAD_PREFIX: &str = "payload/";
 const MAX_SIGNATURE_BYTES: u64 = 256;
 const MAX_ARCHIVE_BYTES: u64 = MAX_PACKAGE_BYTES;
+const MAX_EXTENSION_BYTES: u64 = 64 * 1024;
+// Include headers and padding, with room for GNU extensions on 100,000 entries.
+// Empty extensions also consume budget.
+const MAX_METADATA_BYTES: u64 = 256 * 1024 * 1024;
+// Payloads, manifest, extensions, and at most one header/padding block per entry.
+const MAX_DECOMPRESSED_BYTES: u64 = MAX_PACKAGE_BYTES
+    + MAX_MANIFEST_BYTES
+    + MAX_METADATA_BYTES
+    + (MAX_MANIFEST_ENTRIES as u64 + 2) * 1024
+    + 1024;
 
 #[derive(Debug, Clone)]
 pub struct PackOptions {
@@ -251,17 +262,7 @@ pub fn verify_archive_with_key(
     archive_path: &Path,
     verifying_key: &VerifyingKey,
 ) -> Result<VerifiedPackage> {
-    let file_size = fs::metadata(archive_path)
-        .with_context(|| format!("cannot access update pack {}", archive_path.display()))?
-        .len();
-    ensure!(
-        file_size <= MAX_ARCHIVE_BYTES,
-        "update pack exceeds the compressed-size limit"
-    );
-
-    let file = File::open(archive_path)?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
+    let mut archive = open_archive(archive_path)?;
     let mut entries = archive.entries()?;
     let manifest_entry = entries
         .next()
@@ -395,9 +396,7 @@ pub fn for_each_payload(
     mut callback: impl FnMut(&UpdateEntry, &mut dyn Read) -> Result<()>,
 ) -> Result<()> {
     manifest.validate()?;
-    let file = File::open(archive_path)?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
+    let mut archive = open_archive(archive_path)?;
     let mut entries = archive.entries()?;
     let manifest_entry = entries
         .next()
@@ -514,13 +513,7 @@ pub fn for_each_payload(
 }
 
 fn read_manifest_and_signature(archive_path: &Path) -> Result<UpdateManifest> {
-    ensure!(
-        fs::metadata(archive_path)?.len() <= MAX_ARCHIVE_BYTES,
-        "update pack exceeds the compressed-size limit"
-    );
-    let file = File::open(archive_path)?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
+    let mut archive = open_archive(archive_path)?;
     let mut entries = archive.entries()?;
     let entry = entries
         .next()
@@ -537,6 +530,148 @@ fn read_manifest_and_signature(archive_path: &Path) -> Result<UpdateManifest> {
     let manifest: UpdateManifest = serde_json::from_slice(&bytes)?;
     manifest.validate()?;
     Ok(manifest)
+}
+
+fn open_archive(path: &Path) -> Result<Archive<BoundedArchiveReader<GzDecoder<File>>>> {
+    let file = File::open(path)
+        .with_context(|| format!("cannot access update pack {}", path.display()))?;
+    ensure!(
+        file.metadata()?.len() <= MAX_ARCHIVE_BYTES,
+        "update pack exceeds the compressed-size limit"
+    );
+    Ok(Archive::new(BoundedArchiveReader::new(GzDecoder::new(
+        file,
+    ))))
+}
+
+// Check raw headers before tar's iterator can buffer GNU/PAX extensions. File
+// bodies stream through; only a bounded local PAX body is buffered here to track
+// its size override and keep framing identical to tar's non-raw iterator.
+struct BoundedArchiveReader<R> {
+    inner: R,
+    buffered: io::Cursor<Vec<u8>>,
+    remaining: u64,
+    metadata_bytes: u64,
+    decompressed_bytes: u64,
+    pax_size: Option<u64>,
+}
+
+impl<R: Read> BoundedArchiveReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buffered: io::Cursor::new(Vec::new()),
+            remaining: 0,
+            metadata_bytes: 0,
+            decompressed_bytes: 0,
+            pax_size: None,
+        }
+    }
+
+    fn next_header(&mut self) -> io::Result<bool> {
+        let mut header = Header::new_old();
+        let count = self.inner.read(header.as_mut_bytes())?;
+        if count == 0 {
+            return Ok(false);
+        }
+        self.inner.read_exact(&mut header.as_mut_bytes()[count..])?;
+        if header.as_bytes().iter().all(|byte| *byte == 0) {
+            self.buffered = io::Cursor::new(header.as_bytes().to_vec());
+            return Ok(true);
+        }
+        let kind = header.entry_type();
+        // Sparse entries are already unsupported; reject before tar allocates
+        // its variable-length sparse block map.
+        if kind.is_gnu_sparse() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported sparse archive entry",
+            ));
+        }
+        let extension = kind.is_gnu_longname()
+            || kind.is_gnu_longlink()
+            || kind.is_pax_local_extensions()
+            || kind.is_pax_global_extensions();
+        let mut size = header.entry_size()?;
+        if extension {
+            if size > MAX_EXTENSION_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "archive extension exceeds the size limit",
+                ));
+            }
+        } else if let Some(pax_size) = self.pax_size.take() {
+            size = pax_size;
+        }
+        let padded = size
+            .checked_add(511)
+            .map(|size| size & !511)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "archive size overflow"))?;
+        let bytes = padded
+            .checked_add(512)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "archive size overflow"))?;
+        if extension {
+            self.metadata_bytes += bytes;
+            if self.metadata_bytes > MAX_METADATA_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "archive extensions exceed the metadata limit",
+                ));
+            }
+        }
+        self.decompressed_bytes = self
+            .decompressed_bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= MAX_DECOMPRESSED_BYTES)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "archive exceeds the decompressed-size limit",
+                )
+            })?;
+        self.remaining = padded;
+        let mut buffered = header.as_bytes().to_vec();
+        if kind.is_pax_local_extensions()
+            && (header.as_gnu().is_some() || header.as_ustar().is_some())
+        {
+            buffered.resize(512 + padded as usize, 0);
+            self.inner.read_exact(&mut buffered[512..])?;
+            self.remaining = 0;
+            // Match tar 0.4's first size record and stop at malformed records.
+            self.pax_size = None;
+            for field in tar::PaxExtensions::new(&buffered[512..512 + size as usize]) {
+                let Ok(field) = field else { break };
+                if field.key() == Ok("size") {
+                    self.pax_size = field.value().ok().and_then(|value| value.parse().ok());
+                    break;
+                }
+            }
+        }
+        self.buffered = io::Cursor::new(buffered);
+        Ok(true)
+    }
+}
+
+impl<R: Read> Read for BoundedArchiveReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let count = self.buffered.read(buffer)?;
+        if count > 0 {
+            return Ok(count);
+        }
+        if self.remaining > 0 {
+            let limit = self.remaining.min(buffer.len() as u64) as usize;
+            let count = self.inner.read(&mut buffer[..limit])?;
+            self.remaining -= count as u64;
+            return Ok(count);
+        }
+        if !self.next_header()? {
+            return Ok(0);
+        }
+        self.buffered.read(buffer)
+    }
 }
 
 fn write_archive(
@@ -941,6 +1076,174 @@ mod tests {
     }
 
     #[test]
+    fn rejects_excessive_sizes_before_reading_archive_bodies() {
+        for kind in [
+            EntryType::GNULongName,
+            EntryType::GNULongLink,
+            EntryType::XHeader,
+            EntryType::XGlobalHeader,
+            EntryType::Regular,
+            EntryType::GNUSparse,
+        ] {
+            let mut header = Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(u64::MAX);
+            header.set_cksum();
+            // No body: the size error must precede any attempt to read it.
+            let mut reader = BoundedArchiveReader::new(io::Cursor::new(header.as_bytes()));
+            let error = reader.read_exact(&mut [0; 512]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "{kind:?}: {error}"
+            );
+            assert_eq!(reader.inner.position(), 512);
+        }
+        let mut header = Header::new_gnu();
+        header.set_size(MAX_DECOMPRESSED_BYTES);
+        header.set_cksum();
+        let mut reader = BoundedArchiveReader::new(header.as_bytes().as_slice());
+        let error = reader.read_exact(&mut [0; 512]).unwrap_err();
+        assert!(error.to_string().contains("decompressed-size limit"));
+    }
+
+    #[test]
+    fn bounds_cumulative_extensions_even_when_each_extension_is_within_limit() {
+        let encoder = GzBuilder::new().write(Vec::new(), Compression::fast());
+        let mut builder = Builder::new(encoder);
+        let mut extension = Header::new_gnu();
+        extension.set_entry_type(EntryType::GNULongName);
+        extension.set_size(MAX_EXTENSION_BYTES);
+        extension.set_cksum();
+        for _ in 0..=MAX_METADATA_BYTES / (512 + MAX_EXTENSION_BYTES) {
+            builder
+                .append(&extension, io::repeat(b'a').take(MAX_EXTENSION_BYTES))
+                .unwrap();
+            append_bytes(&mut builder, "payload/file", b"", 0o644).unwrap();
+        }
+        let compressed = builder.into_inner().unwrap().finish().unwrap();
+        let reader = BoundedArchiveReader::new(GzDecoder::new(compressed.as_slice()));
+        let mut archive = Archive::new(reader);
+        let error = archive.entries().unwrap().find_map(Result::err).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("extensions exceed the metadata limit")
+        );
+    }
+
+    #[test]
+    fn preserves_pax_size_overrides_across_gnu_extensions() {
+        for raw_size in [0, 1024, u64::MAX] {
+            let mut builder = Builder::new(Vec::new());
+            builder
+                .append_pax_extensions([
+                    ("size", b"5".as_slice()),
+                    ("path", b"payload/file".as_slice()),
+                ])
+                .unwrap();
+            for (kind, body) in [
+                (EntryType::GNULongName, b"payload/file\0".as_slice()),
+                (EntryType::GNULongLink, b"target\0".as_slice()),
+            ] {
+                let mut header = Header::new_gnu();
+                header.set_entry_type(kind);
+                header.set_size(body.len() as u64);
+                header.set_cksum();
+                builder.append(&header, body).unwrap();
+            }
+            let mut header = Header::new_gnu();
+            header.set_size(raw_size);
+            header.set_cksum();
+            builder.append(&header, b"hello".as_slice()).unwrap();
+            append_bytes(&mut builder, "payload/next", b"ok", 0o644).unwrap();
+            let raw = builder.into_inner().unwrap();
+            let mut archive = Archive::new(BoundedArchiveReader::new(raw.as_slice()));
+            let mut entries = archive.entries().unwrap();
+            let mut entry = entries.next().unwrap().unwrap();
+            assert_eq!(entry.path().unwrap(), Path::new("payload/file"));
+            assert_eq!(entry.size(), 5);
+            assert_eq!(entry.link_name().unwrap().unwrap(), Path::new("target"));
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"hello");
+            let mut entry = entries.next().unwrap().unwrap();
+            assert_eq!(entry.path().unwrap(), Path::new("payload/next"));
+            bytes.clear();
+            entry.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"ok");
+            assert!(entries.next().is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_extensions_in_every_archive_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let package = temp.path().join("original.aup");
+        let malicious = temp.path().join("oversized.aup");
+        let signing_path = temp.path().join("signing.key");
+        let public_path = temp.path().join("signing.pub");
+        fs::create_dir_all(source.join("usr/bin")).unwrap();
+        fs::write(source.join("usr/bin/tool"), b"signed bytes").unwrap();
+        let signing = signing_key();
+        write_key(&signing_path, &signing);
+        fs::write(
+            &public_path,
+            STANDARD.encode(signing.verifying_key().to_bytes()),
+        )
+        .unwrap();
+        let manifest = create_pack(&test_options(&source, &package, &signing_path)).unwrap();
+        let mut raw = Vec::new();
+        GzDecoder::new(File::open(&package).unwrap())
+            .read_to_end(&mut raw)
+            .unwrap();
+        let mut archive = Archive::new(raw.as_slice());
+        let mut positions = Vec::new();
+        let mut end = 0;
+        for entry in archive.entries().unwrap().raw(true) {
+            let entry = entry.unwrap();
+            positions.push(entry.raw_header_position() as usize);
+            end = entry.raw_file_position() + entry.size().div_ceil(512) * 512;
+        }
+        positions.push(end as usize);
+
+        for kind in [
+            EntryType::GNULongName,
+            EntryType::GNULongLink,
+            EntryType::XHeader,
+        ] {
+            for position in &positions {
+                // A highly compressible extension, before each logical entry or at EOF.
+                let mut extension = Header::new_gnu();
+                extension.set_entry_type(kind);
+                extension.set_size(64 * 1024 + 1);
+                extension.set_cksum();
+                let mut encoder = GzBuilder::new()
+                    .write(File::create(&malicious).unwrap(), Compression::default());
+                encoder.write_all(&raw[..*position]).unwrap();
+                encoder.write_all(extension.as_bytes()).unwrap();
+                io::copy(&mut io::repeat(0).take(64 * 1024 + 512), &mut encoder).unwrap();
+                encoder.write_all(&raw[*position..]).unwrap();
+                encoder.finish().unwrap();
+                assert!(fs::metadata(&malicious).unwrap().len() < 4096);
+
+                let errors = [
+                    verify_archive(&malicious, temp.path(), Some(&public_path)).unwrap_err(),
+                    verify_archive_with_key(&malicious, &signing.verifying_key()).unwrap_err(),
+                    for_each_payload(&malicious, &manifest, |_, _| Ok(())).unwrap_err(),
+                ];
+                for error in errors {
+                    assert!(
+                        format!("{error:#}").contains("archive extension exceeds the size limit"),
+                        "{kind:?} at {position}: {error:#}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn supports_gnu_long_paths_without_accepting_extra_entries() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
@@ -958,5 +1261,6 @@ mod tests {
         let manifest = create_pack(&test_options(&source, &package, &signing_path)).unwrap();
         assert!(manifest.entries[0].path.len() > 100);
         verify_archive_with_key(&package, &signing.verifying_key()).unwrap();
+        for_each_payload(&package, &manifest, |_, _| Ok(())).unwrap();
     }
 }
