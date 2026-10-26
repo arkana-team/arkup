@@ -75,6 +75,7 @@ dependencies = [
  "flate2",
  "hex",
  "libc",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
