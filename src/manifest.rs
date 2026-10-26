@@ -277,30 +277,30 @@ pub fn safe_symlink_target(link_path: &str, target: &str) -> bool {
     true
 }
 
-pub fn is_protected_path(value: &str) -> bool {
-    if value == "etc/ld.so.cache"
-        || value.starts_with("etc/ld.so.cache/")
-        || value == "etc/arkup"
-        || value.starts_with("etc/arkup/")
-        || value == "var/lib/arkup"
-        || value.starts_with("var/lib/arkup/")
-        || value == "var/lib/arkpkg"
-        || value.starts_with("var/lib/arkpkg/")
-        || value == "etc/arkpkg"
-        || value.starts_with("etc/arkpkg/")
-    {
-        return true;
-    }
+pub(crate) const PROTECTED_PATHS: &[&str] = &[
+    "etc/ld.so.cache",
+    "etc/arkup",
+    "var/lib/arkup",
+    "var/lib/arkpkg",
+    "etc/arkpkg",
+    "dev",
+    "proc",
+    "sys",
+    "run",
+    "tmp",
+    "home",
+    "var/cache",
+    "var/log",
+    "var/tmp",
+];
 
-    let mut components = value.split('/');
-    let first = components.next().unwrap_or_default();
-    if matches!(first, "dev" | "proc" | "sys" | "run" | "tmp" | "home") {
-        return true;
-    }
-    matches!(
-        (first, components.next().unwrap_or_default()),
-        ("var", "cache" | "log" | "tmp")
-    )
+pub fn is_protected_path(value: &str) -> bool {
+    PROTECTED_PATHS.iter().any(|prefix| {
+        value == *prefix
+            || value
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 #[cfg(test)]
