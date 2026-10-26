@@ -1,7 +1,8 @@
 use crate::key;
 use crate::manifest::{
-    EntryKind, MAX_MANIFEST_BYTES, MAX_PACKAGE_BYTES, UpdateEntry, UpdateManifest,
-    is_protected_path, safe_symlink_target, valid_atom, valid_name, valid_version, validate_path,
+    EntryKind, MAX_MANIFEST_BYTES, MAX_MANIFEST_ENTRIES, MAX_PACKAGE_BYTES, UpdateEntry,
+    UpdateManifest, is_protected_path, safe_symlink_target, valid_atom, valid_name, valid_version,
+    validate_path,
 };
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
@@ -24,6 +25,9 @@ const SIGNATURE_NAME: &str = "arkup.sig";
 const PAYLOAD_PREFIX: &str = "payload/";
 const MAX_SIGNATURE_BYTES: u64 = 256;
 const MAX_ARCHIVE_BYTES: u64 = MAX_PACKAGE_BYTES;
+// Include the manifest, long paths/targets, tar headers, padding, and end markers.
+const MAX_DECODED_BYTES: u64 =
+    MAX_PACKAGE_BYTES + 3 * MAX_MANIFEST_BYTES + (MAX_MANIFEST_ENTRIES as u64 + 2) * 6 * 512 + 1024;
 
 #[derive(Debug, Clone)]
 pub struct PackOptions {
@@ -251,17 +255,7 @@ pub fn verify_archive_with_key(
     archive_path: &Path,
     verifying_key: &VerifyingKey,
 ) -> Result<VerifiedPackage> {
-    let file_size = fs::metadata(archive_path)
-        .with_context(|| format!("cannot access update pack {}", archive_path.display()))?
-        .len();
-    ensure!(
-        file_size <= MAX_ARCHIVE_BYTES,
-        "update pack exceeds the compressed-size limit"
-    );
-
-    let file = File::open(archive_path)?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
+    let mut archive = open_archive(archive_path)?;
     let mut entries = archive.entries()?;
     let manifest_entry = entries
         .next()
@@ -366,6 +360,7 @@ pub fn verify_archive_with_key(
                     "expected symlink at '{}'",
                     relative
                 );
+                ensure!(entry.size() == 0, "symlink payload must be empty");
                 let actual_target = archive_link_target(&entry)?;
                 ensure!(
                     Some(actual_target.as_str()) == expected.target.as_deref(),
@@ -395,9 +390,7 @@ pub fn for_each_payload(
     mut callback: impl FnMut(&UpdateEntry, &mut dyn Read) -> Result<()>,
 ) -> Result<()> {
     manifest.validate()?;
-    let file = File::open(archive_path)?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
+    let mut archive = open_archive(archive_path)?;
     let mut entries = archive.entries()?;
     let manifest_entry = entries
         .next()
@@ -468,6 +461,7 @@ pub fn for_each_payload(
                     "expected symlink at '{}'",
                     relative
                 );
+                ensure!(entry.size() == 0, "symlink payload must be empty");
                 let target = archive_link_target(&entry)?;
                 ensure!(
                     Some(target.as_str()) == expected_entry.target.as_deref(),
@@ -514,13 +508,7 @@ pub fn for_each_payload(
 }
 
 fn read_manifest_and_signature(archive_path: &Path) -> Result<UpdateManifest> {
-    ensure!(
-        fs::metadata(archive_path)?.len() <= MAX_ARCHIVE_BYTES,
-        "update pack exceeds the compressed-size limit"
-    );
-    let file = File::open(archive_path)?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
+    let mut archive = open_archive(archive_path)?;
     let mut entries = archive.entries()?;
     let entry = entries
         .next()
@@ -537,6 +525,19 @@ fn read_manifest_and_signature(archive_path: &Path) -> Result<UpdateManifest> {
     let manifest: UpdateManifest = serde_json::from_slice(&bytes)?;
     manifest.validate()?;
     Ok(manifest)
+}
+
+fn open_archive(archive_path: &Path) -> Result<Archive<DecodedReader<GzDecoder<File>>>> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("cannot access update pack {}", archive_path.display()))?;
+    ensure!(
+        file.metadata()?.len() <= MAX_ARCHIVE_BYTES,
+        "update pack exceeds the compressed-size limit"
+    );
+    Ok(Archive::new(DecodedReader::new(
+        GzDecoder::new(file),
+        MAX_DECODED_BYTES,
+    )))
 }
 
 fn write_archive(
@@ -669,6 +670,38 @@ fn sha256_reader(reader: &mut impl Read) -> Result<String> {
         digest.update(&buffer[..count]);
     }
     Ok(hex::encode(digest.finalize()))
+}
+
+// Bound all decoded reads, including bodies and extension records consumed by tar itself.
+struct DecodedReader<R> {
+    inner: io::Take<R>,
+}
+
+impl<R: Read> DecodedReader<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner: inner.take(limit),
+        }
+    }
+}
+
+impl<R: Read> Read for DecodedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.inner.limit() == 0 {
+            // Take alone would turn an exceeded budget into an apparently valid EOF.
+            if self.inner.get_mut().read(&mut [0_u8; 1])? != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "update pack exceeds the decoded-size limit",
+                ));
+            }
+            return Ok(0);
+        }
+        self.inner.read(buffer)
+    }
 }
 
 struct HashingReader<'a, R> {
@@ -807,11 +840,11 @@ mod tests {
             header.set_mtime(0);
             if entry.kind.is_symlink() {
                 header.set_entry_type(EntryType::Symlink);
-                header.set_size(0);
+                header.set_size(entry.data.len() as u64);
                 header.set_link_name(entry.link.unwrap()).unwrap();
                 header.set_cksum();
                 builder
-                    .append_data(&mut header, entry.path, io::empty())
+                    .append_data(&mut header, entry.path, entry.data.as_slice())
                     .unwrap();
             } else {
                 header.set_entry_type(EntryType::Regular);
@@ -845,6 +878,16 @@ mod tests {
         let verified = verify_archive_with_key(&output, &signing.verifying_key()).unwrap();
         assert_eq!(verified.manifest.name, "desktop-feature");
         assert_eq!(verified.manifest.entries.len(), 3);
+        let mut payloads = 0;
+        for_each_payload(&output, &manifest, |entry, reader| {
+            if entry.kind == EntryKind::Symlink {
+                assert_eq!(reader.read(&mut [0_u8; 1])?, 0);
+            }
+            payloads += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(payloads, 3);
     }
 
     #[test]
@@ -913,6 +956,118 @@ mod tests {
         });
 
         assert!(verify_archive_with_key(&duplicate, &signing.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn rejects_symlink_bodies_before_payload_callbacks() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let package = temp.path().join("original.aup");
+        let modified = temp.path().join("modified.aup");
+        let signing_path = temp.path().join("signing.key");
+        fs::create_dir_all(source.join("usr/bin")).unwrap();
+        symlink("tool", source.join("usr/bin/tool-link")).unwrap();
+        let signing = signing_key();
+        write_key(&signing_path, &signing);
+        let manifest = create_pack(&test_options(&source, &package, &signing_path)).unwrap();
+
+        for size in [1, 512, 513] {
+            // Keep the authenticated manifest, signature, and link metadata intact.
+            rewrite_archive(&package, &modified, |_, _, entries| {
+                entries[0].data = vec![0; size];
+            });
+            let verification = verify_archive_with_key(&modified, &signing.verifying_key());
+            let mut callbacks = 0;
+            let traversal = for_each_payload(&modified, &manifest, |_, _| {
+                callbacks += 1;
+                Ok(())
+            });
+            assert!(verification.is_err(), "accepted a {size}-byte symlink body");
+            assert!(traversal.is_err(), "traversed a {size}-byte symlink body");
+            assert_eq!(
+                verification.unwrap_err().to_string(),
+                "symlink payload must be empty"
+            );
+            assert_eq!(
+                traversal.unwrap_err().to_string(),
+                "symlink payload must be empty"
+            );
+            assert_eq!(callbacks, 0);
+        }
+    }
+
+    #[test]
+    fn decoded_budget_distinguishes_exhaustion_from_eof() {
+        for size in [2, 3, 4] {
+            let data = vec![0_u8; size];
+            let mut reader = DecodedReader::new(data.as_slice(), 3);
+            let mut decoded = Vec::new();
+            let result = reader.read_to_end(&mut decoded);
+            if size <= 3 {
+                result.unwrap();
+                assert_eq!(decoded, data);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                assert_eq!(decoded.len(), 3);
+            }
+            assert_eq!(reader.read(&mut []).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn decoded_budget_counts_tar_skips_and_extension_bodies() {
+        for kind in [
+            EntryType::Regular,
+            EntryType::GNULongName,
+            EntryType::GNULongLink,
+            EntryType::XHeader,
+        ] {
+            let encoder = GzBuilder::new().write(Vec::new(), Compression::default());
+            let mut builder = Builder::new(encoder);
+            let mut header = Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(2048);
+            header.set_mode(0o644);
+            builder
+                .append_data(&mut header, "entry", &[0_u8; 2048][..])
+                .unwrap();
+            let compressed = builder.into_inner().unwrap().finish().unwrap();
+            let decoder = GzDecoder::new(compressed.as_slice());
+            // Permit the header and only part of the body.
+            let mut archive = Archive::new(DecodedReader::new(decoder, 1024));
+            let mut entries = archive.entries().unwrap();
+            if kind.is_file() {
+                // Advancing without reading the entry makes tar discard its body.
+                assert_eq!(entries.next().unwrap().unwrap().size(), 2048);
+            }
+            let error = entries
+                .next()
+                .unwrap()
+                .err()
+                .expect("decoded budget must fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("decoded-size limit"));
+        }
+    }
+
+    #[test]
+    fn decoded_budget_at_header_boundary_does_not_hide_extra_entries() {
+        let mut builder = Builder::new(Vec::new());
+        append_bytes(&mut builder, "first", &[], 0o644).unwrap();
+        append_bytes(&mut builder, "second", &[], 0o644).unwrap();
+        let bytes = builder.into_inner().unwrap();
+        let mut archive = Archive::new(DecodedReader::new(bytes.as_slice(), 512));
+        let mut entries = archive.entries().unwrap();
+        assert_eq!(
+            archive_path_string(&entries.next().unwrap().unwrap()).unwrap(),
+            "first"
+        );
+        let error = entries
+            .next()
+            .unwrap()
+            .err()
+            .expect("extra header must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
