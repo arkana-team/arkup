@@ -38,6 +38,8 @@ arkup pack \
   --version 'arkanaOS 1.0 (alpha 1) build 891' \
   --sequence 891 \
   --arch x86_64 \
+  --system-file etc/os-release \
+  --system-file etc/arkana-build-number \
   --delete usr/bin/retired-tool \
   --description 'arkanaOS system update' \
   --signing-key "release-keys/$KEY_ID.key" \
@@ -60,10 +62,14 @@ signature covers the manifest; the manifest records paths, modes, sizes,
 SHA-256 hashes, symlink targets, architecture, version, and sequence. arkup
 checks the signature and every payload before accepting an update. It rejects
 traversal, duplicate paths, unsafe symlinks, unsupported archive entries, and
-protected mutable paths, including `/etc/ld.so.cache`.
+protected mutable paths, including `/etc/ld.so.cache`, `/var/lib`, `/root`, and
+local timezone and resolver links.
 
 Repeat `--delete PATH` to remove retired files. Existing files are backed up;
-edited configuration files are retained when a deletion is applied.
+edited configuration files are retained when a deletion is applied. Repeat
+`--system-file PATH` for exact paths that the operating system owns, such as
+release identity files under `/etc`; these are replaced as managed system
+files, while other `/etc` configuration remains protected.
 
 Applying an update takes a system lock, saves replaced files under
 `/var/lib/arkup/backups/`, preserves locally edited configuration by writing

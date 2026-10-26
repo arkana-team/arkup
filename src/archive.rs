@@ -29,6 +29,8 @@ const MAX_ARCHIVE_BYTES: u64 = MAX_PACKAGE_BYTES;
 pub struct PackOptions {
     pub source: PathBuf,
     pub deletions: Vec<String>,
+    /// Exact target paths managed by the system, not treated as local config.
+    pub system_files: Vec<String>,
     pub name: String,
     pub version: String,
     pub sequence: u64,
@@ -57,6 +59,20 @@ pub fn create_pack(options: &PackOptions) -> Result<UpdateManifest> {
         options.output.extension().and_then(|ext| ext.to_str()) == Some("aup"),
         "update pack output must use the .aup extension"
     );
+    let mut system_files = HashSet::new();
+    for path in &options.system_files {
+        validate_path(path)?;
+        ensure!(
+            !is_protected_path(path),
+            "system-managed path '{}' is protected",
+            path
+        );
+        ensure!(
+            system_files.insert(path.as_str()),
+            "duplicate system-managed path '{}'",
+            path
+        );
+    }
     let source = options
         .source
         .canonicalize()
@@ -99,6 +115,22 @@ pub fn create_pack(options: &PackOptions) -> Result<UpdateManifest> {
         sources.insert(relative, item.path().to_path_buf());
     }
 
+    for path in &options.system_files {
+        if let Some(source_path) = sources.get(path) {
+            ensure!(
+                fs::symlink_metadata(source_path)?.file_type().is_file(),
+                "system-managed path '{}' must be a regular file",
+                path
+            );
+        } else {
+            ensure!(
+                options.deletions.iter().any(|deleted| deleted == path),
+                "system-managed path '{}' is missing from the source",
+                path
+            );
+        }
+    }
+
     let mut entries = Vec::with_capacity(sources.len());
     for (path, source_path) in &sources {
         let metadata = fs::symlink_metadata(source_path)?;
@@ -124,7 +156,8 @@ pub fn create_pack(options: &PackOptions) -> Result<UpdateManifest> {
             });
         } else {
             let sha256 = sha256_file(source_path)?;
-            let config = path == "etc" || path.starts_with("etc/");
+            let config = (path == "etc" || path.starts_with("etc/"))
+                && !system_files.contains(path.as_str());
             entries.push(UpdateEntry {
                 path: path.clone(),
                 kind: EntryKind::File,
@@ -145,7 +178,8 @@ pub fn create_pack(options: &PackOptions) -> Result<UpdateManifest> {
             size: None,
             sha256: None,
             target: None,
-            config: path == "etc" || path.starts_with("etc/"),
+            config: (path == "etc" || path.starts_with("etc/"))
+                && !system_files.contains(path.as_str()),
         });
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -721,6 +755,7 @@ mod tests {
         PackOptions {
             source: source.to_path_buf(),
             deletions: Vec::new(),
+            system_files: Vec::new(),
             name: "desktop-feature".into(),
             version: "1.2.3".into(),
             sequence: 1,
@@ -848,6 +883,35 @@ mod tests {
     }
 
     #[test]
+    fn marks_only_selected_etc_files_as_system_managed() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let output = temp.path().join("system.aup");
+        let signing_path = temp.path().join("signing.key");
+        fs::create_dir_all(source.join("etc")).unwrap();
+        fs::write(source.join("etc/os-release"), b"VERSION=2\n").unwrap();
+        fs::write(source.join("etc/local.conf"), b"setting=2\n").unwrap();
+        let signing = signing_key();
+        write_key(&signing_path, &signing);
+        let mut options = test_options(&source, &output, &signing_path);
+        options.system_files.push("etc/os-release".into());
+
+        let manifest = create_pack(&options).unwrap();
+        let release = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "etc/os-release")
+            .unwrap();
+        let config = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "etc/local.conf")
+            .unwrap();
+        assert!(!release.config);
+        assert!(config.config);
+    }
+
+    #[test]
     fn packer_excludes_linker_cache_and_mutable_state() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
@@ -855,11 +919,25 @@ mod tests {
         let signing_path = temp.path().join("signing.key");
         fs::create_dir_all(source.join("etc/arkup/trustedkeys.d")).unwrap();
         fs::create_dir_all(source.join("etc/arkpkg")).unwrap();
+        fs::create_dir_all(source.join("var/lib/dbus")).unwrap();
         fs::create_dir_all(source.join("var/lib/arkup/installed")).unwrap();
+        fs::create_dir_all(source.join("root")).unwrap();
+        fs::create_dir_all(source.join("srv/site")).unwrap();
+        fs::create_dir_all(source.join("usr/local/bin")).unwrap();
         fs::create_dir_all(source.join("usr/lib")).unwrap();
         fs::write(source.join("etc/ld.so.cache"), b"host-specific cache").unwrap();
+        symlink("/usr/share/zoneinfo/UTC", source.join("etc/localtime")).unwrap();
+        symlink(
+            "/run/systemd/resolve/stub-resolv.conf",
+            source.join("etc/resolv.conf"),
+        )
+        .unwrap();
         fs::write(source.join("etc/arkpkg/repos.d.json"), b"repository config").unwrap();
+        fs::write(source.join("var/lib/dbus/machine-id"), b"machine id").unwrap();
         fs::write(source.join("var/lib/arkup/installed/old.json"), b"state").unwrap();
+        fs::write(source.join("root/.bashrc"), b"root configuration").unwrap();
+        fs::write(source.join("srv/site/index.html"), b"site data").unwrap();
+        fs::write(source.join("usr/local/bin/local-tool"), b"local tool").unwrap();
         fs::write(source.join("usr/lib/library.so"), b"library").unwrap();
         let signing = signing_key();
         write_key(&signing_path, &signing);

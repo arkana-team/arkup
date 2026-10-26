@@ -280,6 +280,7 @@ pub fn safe_symlink_target(link_path: &str, target: &str) -> bool {
 pub fn is_protected_path(value: &str) -> bool {
     if value == "etc/ld.so.cache"
         || value.starts_with("etc/ld.so.cache/")
+        || matches!(value, "etc/localtime" | "etc/resolv.conf")
         || value == "etc/arkup"
         || value.starts_with("etc/arkup/")
         || value == "var/lib/arkup"
@@ -294,12 +295,15 @@ pub fn is_protected_path(value: &str) -> bool {
 
     let mut components = value.split('/');
     let first = components.next().unwrap_or_default();
-    if matches!(first, "dev" | "proc" | "sys" | "run" | "tmp" | "home") {
+    if matches!(
+        first,
+        "dev" | "proc" | "sys" | "run" | "tmp" | "home" | "root" | "srv"
+    ) {
         return true;
     }
     matches!(
         (first, components.next().unwrap_or_default()),
-        ("var", "cache" | "log" | "tmp")
+        ("var", "cache" | "lib" | "log" | "spool" | "tmp") | ("usr", "local")
     )
 }
 
@@ -311,6 +315,13 @@ mod tests {
     fn rejects_host_cache_and_runtime_paths() {
         assert!(validate_path("etc/ld.so.cache").is_ok());
         assert!(is_protected_path("etc/ld.so.cache"));
+        assert!(is_protected_path("etc/localtime"));
+        assert!(is_protected_path("etc/resolv.conf"));
+        assert!(is_protected_path("root/.NsCDE/NsCDE.conf"));
+        assert!(is_protected_path("srv/site/index.html"));
+        assert!(is_protected_path("usr/local/bin/local-tool"));
+        assert!(is_protected_path("var/lib/dbus/machine-id"));
+        assert!(is_protected_path("var/spool/mail/user"));
         assert!(is_protected_path("var/lib/arkup/installed/system.json"));
         assert!(is_protected_path("dev/null"));
         assert!(!is_protected_path("usr/lib/libc.so.6"));
