@@ -919,6 +919,7 @@ mod tests {
         let signing_path = temp.path().join("signing.key");
         fs::create_dir_all(source.join("etc/arkup/trustedkeys.d")).unwrap();
         fs::create_dir_all(source.join("etc/arkpkg")).unwrap();
+        fs::create_dir_all(source.join("etc")).unwrap();
         fs::create_dir_all(source.join("var/lib/dbus")).unwrap();
         fs::create_dir_all(source.join("var/lib/arkup/installed")).unwrap();
         fs::create_dir_all(source.join("root")).unwrap();
@@ -926,6 +927,7 @@ mod tests {
         fs::create_dir_all(source.join("usr/local/bin")).unwrap();
         fs::create_dir_all(source.join("usr/lib")).unwrap();
         fs::write(source.join("etc/ld.so.cache"), b"host-specific cache").unwrap();
+        fs::write(source.join("etc/machine-id"), b"host machine id").unwrap();
         symlink("/usr/share/zoneinfo/UTC", source.join("etc/localtime")).unwrap();
         symlink(
             "/run/systemd/resolve/stub-resolv.conf",

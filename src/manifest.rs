@@ -280,7 +280,10 @@ pub fn safe_symlink_target(link_path: &str, target: &str) -> bool {
 pub fn is_protected_path(value: &str) -> bool {
     if value == "etc/ld.so.cache"
         || value.starts_with("etc/ld.so.cache/")
-        || matches!(value, "etc/localtime" | "etc/resolv.conf")
+        || matches!(
+            value,
+            "etc/localtime" | "etc/resolv.conf" | "etc/machine-id"
+        )
         || value == "etc/arkup"
         || value.starts_with("etc/arkup/")
         || value == "var/lib/arkup"
@@ -317,6 +320,7 @@ mod tests {
         assert!(is_protected_path("etc/ld.so.cache"));
         assert!(is_protected_path("etc/localtime"));
         assert!(is_protected_path("etc/resolv.conf"));
+        assert!(is_protected_path("etc/machine-id"));
         assert!(is_protected_path("root/.NsCDE/NsCDE.conf"));
         assert!(is_protected_path("srv/site/index.html"));
         assert!(is_protected_path("usr/local/bin/local-tool"));
