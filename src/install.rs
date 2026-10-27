@@ -9,11 +9,14 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
@@ -173,25 +176,28 @@ pub fn trust_key(public_key: &Path, root: &Path) -> Result<PathBuf> {
     }
     let verifying_key = key::load_verifying_key(public_key)?;
     let id = key::key_id(&verifying_key.to_bytes());
-    ensure_state_directory(&root, "etc/arkup/trustedkeys.d")?;
-    let destination = root
-        .join("etc/arkup/trustedkeys.d")
-        .join(format!("{id}.pub"));
+    let directory = trust_directory(&root)?;
+    let filename = format!("{id}.pub");
+    let destination = root.join("etc/arkup/trustedkeys.d").join(&filename);
     let encoded = STANDARD.encode(verifying_key.to_bytes());
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&destination)
-    {
+    match open_at(
+        &directory,
+        OsStr::new(&filename),
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o644,
+    ) {
         Ok(mut file) => {
             file.write_all(encoded.as_bytes())?;
             file.write_all(b"\n")?;
             file.sync_all()?;
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let existing = key::load_verifying_key(&destination)?;
+            let existing = key::read_verifying_key(open_at(
+                &directory,
+                OsStr::new(&filename),
+                libc::O_RDONLY | libc::O_NONBLOCK,
+                0,
+            )?)?;
             ensure!(
                 existing.to_bytes() == verifying_key.to_bytes(),
                 "a different key already exists at {}",
@@ -201,6 +207,90 @@ pub fn trust_key(public_key: &Path, root: &Path) -> Result<PathBuf> {
         Err(error) => return Err(error.into()),
     }
     Ok(destination)
+}
+
+fn open_at(directory: &File, name: &OsStr, flags: i32, mode: libc::mode_t) -> io::Result<File> {
+    let name = CString::new(name.as_bytes())?;
+    // SAFETY: the directory descriptor and NUL-terminated name remain valid for the call.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new descriptor owned by this File.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn check_trust_directory(directory: &File, allow_sticky: bool) -> Result<()> {
+    let metadata = directory.metadata()?;
+    let mode = metadata.permissions().mode();
+    ensure!(
+        metadata.is_dir()
+            && (metadata.uid() == 0 || metadata.uid() == unsafe { libc::geteuid() })
+            && (mode & 0o022 == 0 || (allow_sticky && mode & 0o1000 != 0)),
+        "trust directory ancestry must be owned by root or the current user and not writable by other users"
+    );
+    Ok(())
+}
+
+fn open_trust_path(mut directory: File, path: &Path, allow_sticky: bool) -> Result<File> {
+    check_trust_directory(&directory, allow_sticky)?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            bail!("invalid trust directory path");
+        };
+        directory = open_at(&directory, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        check_trust_directory(&directory, allow_sticky)?;
+    }
+    Ok(directory)
+}
+
+fn trust_directory(root: &Path) -> Result<File> {
+    // Check ancestors above the root as well: an untrusted owner could otherwise
+    // rename the selected tree. Sticky ancestors such as /tmp protect owned entries.
+    let root_directory = open_trust_path(File::open("/")?, root.strip_prefix("/")?, true)?;
+    check_trust_directory(&root_directory, false)?;
+    let mut directory = root_directory.try_clone()?;
+    let mut current = root.to_path_buf();
+    for name in ["etc", "arkup", "trustedkeys.d"] {
+        let candidate = current.join(name);
+        match candidate.canonicalize() {
+            Ok(resolved) => {
+                // Preserve directory symlinks within the root, but reopen their
+                // resolved components without following symlinks and check each handle.
+                let relative = resolved
+                    .strip_prefix(root)
+                    .context("trust directory symlink escapes the target root")?;
+                directory = open_trust_path(root_directory.try_clone()?, relative, false)?;
+                current = resolved;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = CString::new(name)?;
+                // SAFETY: both arguments remain valid; name is a single fixed component.
+                let result =
+                    unsafe { libc::mkdirat(directory.as_raw_fd(), component.as_ptr(), 0o755) };
+                if result != 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                directory = open_at(
+                    &directory,
+                    OsStr::new(name),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                )?;
+                check_trust_directory(&directory, false)?;
+                current = candidate;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(directory)
 }
 
 fn apply_file(
@@ -700,6 +790,119 @@ mod tests {
     use crate::archive::{PackOptions, create_pack};
     use crate::key::generate_keypair;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn trust_creates_keys_and_checks_existing_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, _, public_key) = generate_keypair(&temp.path().join("keys")).unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let destination = trust_key(&public_key, &root).unwrap();
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            fs::read(&public_key).unwrap()
+        );
+        assert_eq!(trust_key(&public_key, &root).unwrap(), destination);
+
+        let (_, _, other_key) = generate_keypair(&temp.path().join("other-keys")).unwrap();
+        fs::copy(other_key, &destination).unwrap();
+        assert!(
+            trust_key(&public_key, &root)
+                .unwrap_err()
+                .to_string()
+                .contains("a different key already exists")
+        );
+        fs::remove_file(&destination).unwrap();
+        symlink(&public_key, &destination).unwrap();
+        assert!(trust_key(&public_key, &root).is_err());
+    }
+
+    #[test]
+    fn trust_rejects_directory_escapes_and_preserves_contained_symlinks() {
+        for component in ["etc", "etc/arkup", "etc/arkup/trustedkeys.d"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (_, _, public_key) = generate_keypair(&temp.path().join("keys")).unwrap();
+            let root = temp.path().join("root");
+            let outside = temp.path().join("outside");
+            let link = root.join(component);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            fs::create_dir(&outside).unwrap();
+            symlink(&outside, &link).unwrap();
+            assert!(trust_key(&public_key, &root).is_err());
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+
+            fs::remove_file(&link).unwrap();
+            let contained = root.join("contained");
+            fs::create_dir(&contained).unwrap();
+            symlink(&contained, &link).unwrap();
+            let destination = trust_key(&public_key, &root).unwrap();
+            assert_eq!(
+                fs::read(destination).unwrap(),
+                fs::read(public_key).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn trust_rejects_writable_directory_ancestry_before_creating_keys() {
+        for component in ["", "etc", "etc/arkup", "etc/arkup/trustedkeys.d"] {
+            for mode in [0o775, 0o777, 0o1777] {
+                let temp = tempfile::tempdir().unwrap();
+                let (_, _, public_key) = generate_keypair(&temp.path().join("keys")).unwrap();
+                let root = temp.path().join("root");
+                let directory = root.join(component);
+                fs::create_dir_all(&directory).unwrap();
+                fs::set_permissions(&directory, fs::Permissions::from_mode(mode)).unwrap();
+                assert!(trust_key(&public_key, &root).is_err());
+                assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let (_, _, public_key) = generate_keypair(&temp.path().join("keys")).unwrap();
+        let parent = temp.path().join("writable-parent");
+        let root = parent.join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(trust_key(&public_key, &root).is_err());
+        assert!(!root.join("etc").exists());
+    }
+
+    #[test]
+    fn trust_directory_handle_pins_creation_and_existing_key_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, _, public_key) = generate_keypair(&temp.path().join("keys")).unwrap();
+        let verifying_key = key::load_verifying_key(&public_key).unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir_all(outside.join("arkup/trustedkeys.d")).unwrap();
+        let directory = trust_directory(&root).unwrap();
+        fs::rename(root.join("etc"), root.join("saved-etc")).unwrap();
+        symlink(&outside, root.join("etc")).unwrap();
+
+        let name = OsStr::new("test.pub");
+        let encoded = STANDARD.encode(verifying_key.to_bytes());
+        let mut file = open_at(
+            &directory,
+            name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o644,
+        )
+        .unwrap();
+        file.write_all(encoded.as_bytes()).unwrap();
+        assert!(!outside.join("arkup/trustedkeys.d/test.pub").exists());
+        assert!(
+            root.join("saved-etc/arkup/trustedkeys.d/test.pub")
+                .is_file()
+        );
+        fs::write(outside.join("arkup/trustedkeys.d/test.pub"), b"invalid").unwrap();
+        let existing = key::read_verifying_key(
+            open_at(&directory, name, libc::O_RDONLY | libc::O_NONBLOCK, 0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(existing.to_bytes(), verifying_key.to_bytes());
+    }
 
     #[test]
     fn apply_preserves_modified_config_and_records_install() {

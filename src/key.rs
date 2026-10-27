@@ -55,7 +55,11 @@ pub fn load_signing_key(path: &Path) -> Result<SigningKey> {
 }
 
 pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey> {
-    let encoded = read_key_text(path, false)?;
+    read_verifying_key(open_key(path)?)
+}
+
+pub(crate) fn read_verifying_key(file: File) -> Result<VerifyingKey> {
+    let encoded = read_open_key_text(file, false)?;
     let bytes = STANDARD
         .decode(encoded.trim())
         .context("trusted key is not valid base64")?;
@@ -66,11 +70,18 @@ pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey> {
 }
 
 fn read_key_text(path: &Path, private: bool) -> Result<String> {
-    let mut file = OpenOptions::new()
+    read_open_key_text(open_key(path)?, private)
+}
+
+fn open_key(path: &Path) -> Result<File> {
+    OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
-        .with_context(|| format!("cannot open key {}", path.display()))?;
+        .with_context(|| format!("cannot open key {}", path.display()))
+}
+
+fn read_open_key_text(mut file: File, private: bool) -> Result<String> {
     let metadata = file.metadata()?;
     ensure!(metadata.file_type().is_file(), "key must be a regular file");
     if private {
