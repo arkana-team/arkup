@@ -463,13 +463,27 @@ fn is_modified_config(
     Ok(installed_hash != Some(current_hash.as_str()))
 }
 
-fn resolve_protected_path(root: &Path, relative: &str) -> Result<PathBuf> {
+fn resolve_protected_path(root: &Path, relative: &str) -> Result<Vec<PathBuf>> {
     let path = root.join(relative);
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("invalid protected path {}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid protected path {}", path.display()))?;
     // Missing protected paths still reserve their location beneath the nearest
     // existing parent, including when that parent is a directory symlink.
-    for ancestor in path.ancestors() {
+    for ancestor in parent.ancestors() {
         match ancestor.canonicalize() {
-            Ok(resolved) => return Ok(resolved.join(path.strip_prefix(ancestor)?)),
+            Ok(resolved) => {
+                let entry = resolved.join(parent.strip_prefix(ancestor)?).join(name);
+                let mut prefixes = vec![entry.clone()];
+                // Protect a directory alias's target, but not a leaf symlink's target.
+                if fs::metadata(&entry).is_ok_and(|metadata| metadata.is_dir()) {
+                    prefixes.push(entry.canonicalize()?);
+                }
+                return Ok(prefixes);
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -523,6 +537,9 @@ fn resolve_path(
             .iter()
             .map(|path| resolve_protected_path(root, path))
             .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect()
     };
     let protected = (!allow_protected).then_some(protected.as_slice());
     let root_directory = File::options()
@@ -1292,6 +1309,22 @@ mod tests {
                 assert!(!root.join(directory).join("missing").exists());
             }
         }
+    }
+
+    #[test]
+    fn protected_leaf_symlinks_do_not_protect_their_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let zoneinfo = root.join("usr/share/zoneinfo/UTC");
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::create_dir_all(zoneinfo.parent().unwrap()).unwrap();
+        fs::write(&zoneinfo, b"timezone data").unwrap();
+        symlink("../usr/share/zoneinfo/UTC", root.join("etc/localtime")).unwrap();
+
+        let destination =
+            resolve_destination(&root, "usr/share/zoneinfo/UTC", &mut Vec::new(), false).unwrap();
+
+        assert_eq!(destination.path, zoneinfo);
     }
 
     #[test]
