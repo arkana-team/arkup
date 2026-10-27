@@ -227,7 +227,7 @@ pub fn validate_path(value: &str) -> Result<()> {
             && !value.contains('\\')
             && !value.starts_with('/')
             && !value.chars().any(char::is_control),
-        "invalid update path '{}'",
+        "invalid update path {:?}",
         value
     );
     let path = Path::new(value);

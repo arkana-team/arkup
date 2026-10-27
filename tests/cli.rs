@@ -46,6 +46,58 @@ fn pack(source: &Path, key: &Path, output: &Path, sequence: u64, deletions: &[&s
 }
 
 #[test]
+fn rejects_unsigned_manifest_path_control_characters_in_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = temp.path().join("unsigned.aup");
+    let root = temp.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let path = "usr/bin/tool\narkup: forged success\r\t\0\x1b[2J\u{7f}\u{85}";
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "format_version": 1,
+        "name": "system-update",
+        "version": "1.0.1",
+        "sequence": 1,
+        "architecture": "any",
+        "description": "diagnostic test",
+        "key_id": "0".repeat(64),
+        "entries": [{ "path": path, "kind": "delete", "mode": 0 }]
+    }))
+    .unwrap();
+    let encoder = flate2::write::GzEncoder::new(
+        fs::File::create(&package).unwrap(),
+        flate2::Compression::default(),
+    );
+    let mut archive = tar::Builder::new(encoder);
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(0o644);
+    header.set_size(manifest.len() as u64);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, "arkup.json", manifest.as_slice())
+        .unwrap();
+    archive.into_inner().unwrap().finish().unwrap();
+
+    for command in ["verify", "list", "apply"] {
+        let output = arkup()
+            .arg(command)
+            .arg(&package)
+            .arg("--root")
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let diagnostic = stderr.strip_suffix('\n').unwrap();
+        assert!(diagnostic.contains("invalid update path"));
+        assert!(!diagnostic.chars().any(char::is_control));
+        assert!(diagnostic.contains(r"\narkup: forged success"));
+        assert!(diagnostic.contains(r"\u{1b}[2J"));
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+    }
+}
+
+#[test]
 fn cli_builds_verifies_trusts_and_applies_successive_aup_updates() {
     let temp = tempfile::tempdir().unwrap();
     let keys = temp.path().join("release-keys");
