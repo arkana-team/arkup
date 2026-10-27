@@ -1,12 +1,16 @@
+mod destination;
+
 use crate::archive::{for_each_payload, verify_archive};
 use crate::key;
 use crate::manifest::{
-    EntryKind, FORMAT_VERSION, MAX_MANIFEST_BYTES, UpdateEntry, UpdateManifest, valid_name,
-    valid_version,
+    EntryKind, FORMAT_VERSION, MAX_MANIFEST_BYTES, PROTECTED_PATHS, UpdateEntry, UpdateManifest,
+    is_protected_path, valid_name, valid_version,
 };
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use destination::{Destination, create_directory, open_directory};
+use rustix::fs::{AtFlags, FileType, Stat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::{CString, OsStr};
@@ -18,7 +22,6 @@ use std::os::unix::fs::symlink;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tempfile::NamedTempFile;
 
 const RECORD_FORMAT: u32 = 1;
 
@@ -43,13 +46,18 @@ struct InstalledRecord {
 }
 
 struct AppliedChange {
-    destination: PathBuf,
+    destination: Destination,
     backup: Option<Snapshot>,
 }
 
 struct Snapshot {
     path: PathBuf,
-    metadata: fs::Metadata,
+    kind: SnapshotKind,
+}
+
+enum SnapshotKind {
+    Symlink,
+    File(fs::Metadata),
 }
 
 pub fn apply(options: &ApplyOptions) -> Result<UpdateManifest> {
@@ -305,25 +313,22 @@ fn apply_file(
     previous: Option<&InstalledRecord>,
     backup_root: &Path,
     changes: &mut Vec<AppliedChange>,
-    created_directories: &mut Vec<PathBuf>,
+    created_directories: &mut Vec<Destination>,
 ) -> Result<()> {
-    let mut destination = resolve_destination(root, &entry.path, created_directories)?;
-    let metadata = existing_metadata(&destination)?;
+    let mut destination = resolve_destination(root, &entry.path, created_directories, false)?;
+    let metadata = destination.existing_metadata()?;
     if entry.config && is_modified_config(&destination, metadata.as_ref(), entry, previous)? {
         let sidecar = format!("{}.arkup-new", entry.path);
-        destination = resolve_destination(root, &sidecar, created_directories)?;
+        destination = resolve_destination(root, &sidecar, created_directories, false)?;
         ensure!(
-            existing_metadata(&destination)?.is_none(),
+            destination.existing_metadata()?.is_none(),
             "refusing to overwrite existing configuration update {}",
-            destination.display()
+            destination.path.display()
         );
     }
 
-    let parent = destination
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("update destination has no parent"))?;
-    let mut staged = NamedTempFile::new_in(parent)?;
-    let (size, digest) = copy_and_hash(reader, staged.as_file_mut())?;
+    let (staged, mut file) = destination.stage_file()?;
+    let (size, digest) = copy_and_hash(reader, &mut file)?;
     ensure!(
         Some(size) == entry.size,
         "size mismatch for '{}'",
@@ -334,14 +339,10 @@ fn apply_file(
         "SHA-256 mismatch for '{}'",
         entry.path
     );
-    staged
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(entry.mode))?;
-    staged.as_file().sync_all()?;
+    file.set_permissions(fs::Permissions::from_mode(entry.mode))?;
+    file.sync_all()?;
     let backup = snapshot_existing(root, &destination, &entry.path, backup_root)?;
-    staged.persist(&destination).map_err(|error| {
-        anyhow::anyhow!("cannot install {}: {}", destination.display(), error.error)
-    })?;
+    staged.persist(&destination)?;
     changes.push(AppliedChange {
         destination,
         backup,
@@ -355,28 +356,21 @@ fn apply_symlink(
     reader: &mut dyn Read,
     backup_root: &Path,
     changes: &mut Vec<AppliedChange>,
-    created_directories: &mut Vec<PathBuf>,
+    created_directories: &mut Vec<Destination>,
 ) -> Result<()> {
     let mut remaining = [0_u8; 1];
     ensure!(
         reader.read(&mut remaining)? == 0,
         "symlink payload must be empty"
     );
-    let destination = resolve_destination(root, &entry.path, created_directories)?;
-    let parent = destination
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("update destination has no parent"))?;
+    let destination = resolve_destination(root, &entry.path, created_directories, false)?;
     let target = entry
         .target
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("symlink '{}' has no target", entry.path))?;
-    let temporary_directory = tempfile::Builder::new()
-        .prefix(".arkup-link-")
-        .tempdir_in(parent)?;
-    let temporary_link = temporary_directory.path().join("link");
-    symlink(target, &temporary_link)?;
+    let staged = destination.stage_symlink(Path::new(target))?;
     let backup = snapshot_existing(root, &destination, &entry.path, backup_root)?;
-    fs::rename(&temporary_link, &destination)?;
+    staged.persist(&destination)?;
     changes.push(AppliedChange {
         destination,
         backup,
@@ -400,15 +394,16 @@ fn apply_delete(
     let Some(destination) = resolve_existing_destination(root, &entry.path)? else {
         return Ok(());
     };
-    let Some(metadata) = existing_metadata(&destination)? else {
+    let Some(metadata) = destination.existing_metadata()? else {
         return Ok(());
     };
     if entry.config && is_modified_deleted_config(&destination, &metadata, entry, previous)? {
         return Ok(());
     }
     let backup = snapshot_existing(root, &destination, &entry.path, backup_root)?;
-    fs::remove_file(&destination)
-        .with_context(|| format!("cannot remove update path {}", destination.display()))?;
+    destination
+        .remove(AtFlags::empty())
+        .with_context(|| format!("cannot remove update path {}", destination.path.display()))?;
     changes.push(AppliedChange {
         destination,
         backup,
@@ -417,12 +412,12 @@ fn apply_delete(
 }
 
 fn is_modified_deleted_config(
-    destination: &Path,
-    current_metadata: &fs::Metadata,
+    destination: &Destination,
+    current_metadata: &Stat,
     deleted: &UpdateEntry,
     previous: Option<&InstalledRecord>,
 ) -> Result<bool> {
-    if !current_metadata.file_type().is_file() {
+    if !FileType::from_raw_mode(current_metadata.st_mode).is_file() {
         return Ok(true);
     }
     let Some(installed_hash) = previous
@@ -441,15 +436,15 @@ fn is_modified_deleted_config(
 }
 
 fn is_modified_config(
-    destination: &Path,
-    current_metadata: Option<&fs::Metadata>,
+    destination: &Destination,
+    current_metadata: Option<&Stat>,
     incoming: &UpdateEntry,
     previous: Option<&InstalledRecord>,
 ) -> Result<bool> {
     let Some(metadata) = current_metadata else {
         return Ok(false);
     };
-    if !metadata.file_type().is_file() {
+    if !FileType::from_raw_mode(metadata.st_mode).is_file() {
         return Ok(true);
     }
     let current_hash = sha256_file(destination)?;
@@ -468,100 +463,159 @@ fn is_modified_config(
     Ok(installed_hash != Some(current_hash.as_str()))
 }
 
+fn resolve_protected_path(root: &Path, relative: &str) -> Result<Vec<PathBuf>> {
+    let path = root.join(relative);
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("invalid protected path {}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid protected path {}", path.display()))?;
+    // Missing protected paths still reserve their location beneath the nearest
+    // existing parent, including when that parent is a directory symlink.
+    for ancestor in parent.ancestors() {
+        match ancestor.canonicalize() {
+            Ok(resolved) => {
+                let entry = resolved.join(parent.strip_prefix(ancestor)?).join(name);
+                let mut prefixes = vec![entry.clone()];
+                // Protect a directory alias's target, but not a leaf symlink's target.
+                if fs::metadata(&entry).is_ok_and(|metadata| metadata.is_dir()) {
+                    prefixes.push(entry.canonicalize()?);
+                }
+                return Ok(prefixes);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!("cannot resolve protected path {}", path.display())
+}
+
+fn check_destination(root: &Path, path: &Path, protected: Option<&[PathBuf]>) -> Result<()> {
+    let relative = path
+        .strip_prefix(root)
+        .context("update path escaped target root")?;
+    if let Some(protected) = protected {
+        ensure!(
+            !is_protected_path(&relative.to_string_lossy())
+                && !protected.iter().any(|prefix| path.starts_with(prefix)),
+            "update pack may not write protected path '{}'",
+            relative.display()
+        );
+    }
+    Ok(())
+}
+
 fn resolve_destination(
     root: &Path,
     relative: &str,
-    created_directories: &mut Vec<PathBuf>,
-) -> Result<PathBuf> {
-    let components: Vec<_> = relative.split('/').collect();
-    ensure!(!components.is_empty(), "empty update path");
-    let mut current = root.to_path_buf();
-    for component in &components[..components.len() - 1] {
-        let candidate = current.join(component);
-        match fs::symlink_metadata(&candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let resolved = candidate.canonicalize().with_context(|| {
-                    format!("cannot resolve update directory {}", candidate.display())
-                })?;
-                ensure!(
-                    resolved.starts_with(root) && resolved.is_dir(),
-                    "update path traverses a directory symlink outside the target root: {}",
-                    candidate.display()
-                );
-                current = resolved;
-            }
-            Ok(metadata) if metadata.is_dir() => current = candidate,
-            Ok(_) => bail!(
-                "update path parent is not a directory: {}",
-                candidate.display()
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&candidate).with_context(|| {
-                    format!("cannot create update directory {}", candidate.display())
-                })?;
-                fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755))?;
-                created_directories.push(candidate.clone());
-                current = candidate;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(current.join(components[components.len() - 1]))
+    created_directories: &mut Vec<Destination>,
+    allow_protected: bool,
+) -> Result<Destination> {
+    resolve_path(root, relative, Some(created_directories), allow_protected)?
+        .ok_or_else(|| anyhow::anyhow!("missing update destination parent"))
 }
 
-fn resolve_existing_destination(root: &Path, relative: &str) -> Result<Option<PathBuf>> {
-    let components: Vec<_> = relative.split('/').collect();
-    ensure!(!components.is_empty(), "empty update path");
-    let mut current = root.to_path_buf();
-    for component in &components[..components.len() - 1] {
-        let candidate = current.join(component);
-        match fs::symlink_metadata(&candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let resolved = candidate.canonicalize().with_context(|| {
-                    format!("cannot resolve update directory {}", candidate.display())
-                })?;
-                ensure!(
-                    resolved.starts_with(root) && resolved.is_dir(),
-                    "update path traverses a directory symlink outside the target root: {}",
-                    candidate.display()
-                );
-                current = resolved;
-            }
-            Ok(metadata) if metadata.is_dir() => current = candidate,
-            Ok(_) => bail!(
-                "update path parent is not a directory: {}",
-                candidate.display()
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let destination = current.join(components[components.len() - 1]);
-    Ok(existing_metadata(&destination)?.map(|_| destination))
+fn resolve_existing_destination(root: &Path, relative: &str) -> Result<Option<Destination>> {
+    resolve_path(root, relative, None, false)
 }
 
-fn existing_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            ensure!(
-                metadata.file_type().is_file() || metadata.file_type().is_symlink(),
-                "refusing to replace unsupported destination {}",
-                path.display()
-            );
-            Ok(Some(metadata))
+fn resolve_path(
+    root: &Path,
+    relative: &str,
+    mut created_directories: Option<&mut Vec<Destination>>,
+    allow_protected: bool,
+) -> Result<Option<Destination>> {
+    let components: Vec<_> = relative.split('/').collect();
+    ensure!(!components.is_empty(), "empty update path");
+    // Protected state may itself live under a directory alias (e.g. /var).
+    // Protect both its logical path and its physical location.
+    let protected: Vec<_> = if allow_protected {
+        Vec::new()
+    } else {
+        PROTECTED_PATHS
+            .iter()
+            .map(|path| resolve_protected_path(root, path))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+    let protected = (!allow_protected).then_some(protected.as_slice());
+    let root_directory = File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)?;
+    let mut parent = root_directory.try_clone()?;
+    let mut current = root.to_path_buf();
+    for component in &components[..components.len() - 1] {
+        let candidate = Destination {
+            parent: parent.try_clone()?,
+            name: (*component).into(),
+            path: current.join(component),
+        };
+        check_destination(root, &candidate.path, protected)?;
+        match candidate.metadata()? {
+            Some(metadata) if FileType::from_raw_mode(metadata.st_mode).is_symlink() => {
+                let resolved = candidate.path.canonicalize().with_context(|| {
+                    format!(
+                        "cannot resolve update directory {}",
+                        candidate.path.display()
+                    )
+                })?;
+                ensure!(
+                    resolved.starts_with(root),
+                    "update path traverses a directory symlink outside the target root: {}",
+                    candidate.path.display()
+                );
+                check_destination(root, &resolved, protected)?;
+                // Open every resolved component without following symlinks. A
+                // concurrent replacement after canonicalize must fail closed.
+                parent = root_directory.try_clone()?;
+                for part in resolved.strip_prefix(root)?.components() {
+                    parent = open_directory(&parent, Path::new(part.as_os_str()))?;
+                }
+                current = resolved;
+            }
+            Some(metadata) if FileType::from_raw_mode(metadata.st_mode).is_dir() => {
+                parent = open_directory(&parent, Path::new(component))?;
+                current = candidate.path;
+            }
+            Some(_) => bail!(
+                "update path parent is not a directory: {}",
+                candidate.path.display()
+            ),
+            None => {
+                let Some(created) = created_directories.as_mut() else {
+                    return Ok(None);
+                };
+                parent = create_directory(&parent, component).with_context(|| {
+                    format!(
+                        "cannot create update directory {}",
+                        candidate.path.display()
+                    )
+                })?;
+                current = candidate.path.clone();
+                created.push(candidate);
+            }
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
     }
+    let destination = Destination {
+        parent,
+        name: components[components.len() - 1].into(),
+        path: current.join(components[components.len() - 1]),
+    };
+    check_destination(root, &destination.path, protected)?;
+    Ok(Some(destination))
 }
 
 fn snapshot_existing(
     _root: &Path,
-    destination: &Path,
+    destination: &Destination,
     relative: &str,
     backup_root: &Path,
 ) -> Result<Option<Snapshot>> {
-    let Some(mut metadata) = existing_metadata(destination)? else {
+    let Some(metadata) = destination.existing_metadata()? else {
         return Ok(None);
     };
     let backup = backup_root.join(relative);
@@ -573,29 +627,31 @@ fn snapshot_existing(
         backup.starts_with(backup_root),
         "backup path escaped backup directory"
     );
-    if metadata.file_type().is_symlink() {
-        symlink(fs::read_link(destination)?, &backup)?;
+    if FileType::from_raw_mode(metadata.st_mode).is_symlink() {
+        symlink(destination.read_link()?, &backup)?;
+        Ok(Some(Snapshot {
+            path: backup,
+            kind: SnapshotKind::Symlink,
+        }))
     } else {
-        let mut source = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(destination)?;
+        let mut source = destination.open_file()?;
         // Save ownership and mode from the same inode as the backed-up bytes.
-        metadata = source.metadata()?;
+        let metadata = source.metadata()?;
         ensure!(metadata.is_file(), "backup source must be a regular file");
         let mut saved = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&backup)?;
         io::copy(&mut source, &mut saved)?;
         saved.set_permissions(metadata.permissions())?;
         saved.sync_all()?;
+        Ok(Some(Snapshot {
+            path: backup,
+            kind: SnapshotKind::File(metadata),
+        }))
     }
-    Ok(Some(Snapshot {
-        path: backup,
-        metadata,
-    }))
 }
 
 fn write_record(
@@ -604,28 +660,21 @@ fn write_record(
     record: &InstalledRecord,
     backup_root: &Path,
     changes: &mut Vec<AppliedChange>,
-    created_directories: &mut Vec<PathBuf>,
+    created_directories: &mut Vec<Destination>,
 ) -> Result<()> {
     let relative = record_path
         .strip_prefix(root)
         .context("installed record is outside the target root")?
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/");
-    let destination = resolve_destination(root, &relative, created_directories)?;
-    let parent = destination
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("installed record has no parent"))?;
+    let destination = resolve_destination(root, &relative, created_directories, true)?;
     let bytes = serde_json::to_vec_pretty(record)?;
-    let mut staged = NamedTempFile::new_in(parent)?;
-    staged.write_all(&bytes)?;
-    staged
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o644))?;
-    staged.as_file().sync_all()?;
+    let (staged, mut file) = destination.stage_file()?;
+    file.write_all(&bytes)?;
+    file.set_permissions(fs::Permissions::from_mode(0o644))?;
+    file.sync_all()?;
     let backup = snapshot_existing(root, &destination, &relative, backup_root)?;
-    staged
-        .persist(&destination)
-        .map_err(|error| anyhow::anyhow!("cannot write installed record: {}", error.error))?;
+    staged.persist(&destination)?;
     changes.push(AppliedChange {
         destination,
         backup,
@@ -633,19 +682,19 @@ fn write_record(
     Ok(())
 }
 
-fn rollback(changes: &[AppliedChange], created_directories: &[PathBuf]) -> Result<()> {
+fn rollback(changes: &[AppliedChange], created_directories: &[Destination]) -> Result<()> {
     let mut errors = Vec::new();
     for change in changes.iter().rev() {
         if let Err(error) = restore_change(change) {
-            errors.push(format!("{}: {error:#}", change.destination.display()));
+            errors.push(format!("{}: {error:#}", change.destination.path.display()));
         }
     }
     for directory in created_directories.iter().rev() {
-        if let Err(error) = fs::remove_dir(directory) {
+        if let Err(error) = directory.remove(AtFlags::REMOVEDIR) {
             if error.kind() != io::ErrorKind::NotFound
                 && error.kind() != io::ErrorKind::DirectoryNotEmpty
             {
-                errors.push(format!("{}: {error}", directory.display()));
+                errors.push(format!("{}: {error}", directory.path.display()));
             }
         }
     }
@@ -666,39 +715,35 @@ fn restore_change_with_owner(
     change: &AppliedChange,
     restore_owner: impl FnOnce(&File, &fs::Metadata) -> Result<()>,
 ) -> Result<()> {
-    let remove_destination = change
-        .backup
-        .as_ref()
-        .is_none_or(|backup| backup.metadata.file_type().is_symlink());
-    match fs::symlink_metadata(&change.destination) {
-        Ok(metadata) if metadata.is_dir() => bail!(
-            "cannot remove directory while rolling back {}",
-            change.destination.display()
-        ),
-        Ok(_) if remove_destination => fs::remove_file(&change.destination)?,
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+    if let Some(metadata) = change.destination.metadata()? {
+        if FileType::from_raw_mode(metadata.st_mode).is_dir() {
+            bail!(
+                "cannot remove directory while rolling back {}",
+                change.destination.path.display()
+            );
+        }
     }
     if let Some(backup) = &change.backup {
-        let metadata = &backup.metadata;
-        if metadata.file_type().is_symlink() {
-            symlink(fs::read_link(&backup.path)?, &change.destination)?;
-        } else {
-            let parent = change
-                .destination
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("restore destination has no parent"))?;
-            let mut staged = NamedTempFile::new_in(parent)?;
-            io::copy(&mut File::open(&backup.path)?, staged.as_file_mut())?;
-            // Keep the temporary file private until ownership is restored.
-            // chown can clear setuid/setgid bits, so apply the saved mode last.
-            restore_owner(staged.as_file(), metadata)?;
-            staged.as_file().set_permissions(metadata.permissions())?;
-            staged
-                .persist(&change.destination)
-                .map_err(|error| error.error)?;
+        match &backup.kind {
+            SnapshotKind::Symlink => {
+                let staged = change
+                    .destination
+                    .stage_symlink(&fs::read_link(&backup.path)?)?;
+                staged.persist(&change.destination)?;
+            }
+            SnapshotKind::File(metadata) => {
+                let (staged, mut file) = change.destination.stage_file()?;
+                io::copy(&mut File::open(&backup.path)?, &mut file)?;
+                // Keep the staged file private until ownership is restored.
+                // chown can clear setuid/setgid bits, so apply the saved mode last.
+                restore_owner(&file, metadata)?;
+                file.set_permissions(metadata.permissions())?;
+                file.sync_all()?;
+                staged.persist(&change.destination)?;
+            }
         }
+    } else if change.destination.metadata()?.is_some() {
+        change.destination.remove(AtFlags::empty())?;
     }
     Ok(())
 }
@@ -742,11 +787,11 @@ fn read_record(path: &Path, expected_name: &str) -> Result<Option<InstalledRecor
 fn ensure_state_directory(root: &Path, relative: &str) -> Result<()> {
     let mut created = Vec::new();
     let marker = format!("{relative}/.arkup-directory-marker");
-    let marker_path = resolve_destination(root, &marker, &mut created)?;
-    let parent = marker_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("state directory has no parent"))?;
-    ensure!(parent.is_dir(), "cannot create arkup state directory");
+    let marker_path = resolve_destination(root, &marker, &mut created, true)?;
+    ensure!(
+        marker_path.parent.metadata()?.is_dir(),
+        "cannot create arkup state directory"
+    );
     Ok(())
 }
 
@@ -801,8 +846,8 @@ fn copy_and_hash(reader: &mut dyn Read, writer: &mut File) -> Result<(u64, Strin
     Ok((total, hex::encode(digest.finalize())))
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path)?;
+fn sha256_file(destination: &Destination) -> Result<String> {
+    let mut file = destination.open_file()?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -825,16 +870,19 @@ mod tests {
     #[test]
     fn failed_owner_restore_keeps_destination_and_recovery_backup() {
         let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("installed-file");
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let destination_path = root.join("installed-file");
         let backup_path = temp.path().join("original-file");
-        fs::write(&destination, b"updated file").unwrap();
+        fs::write(&destination_path, b"updated file").unwrap();
         fs::write(&backup_path, b"original file").unwrap();
         let backup = Snapshot {
-            metadata: fs::symlink_metadata(&backup_path).unwrap(),
             path: backup_path.clone(),
+            kind: SnapshotKind::File(fs::metadata(&backup_path).unwrap()),
         };
         let change = AppliedChange {
-            destination: destination.clone(),
+            destination: resolve_destination(&root, "installed-file", &mut Vec::new(), false)
+                .unwrap(),
             backup: Some(backup),
         };
 
@@ -843,7 +891,7 @@ mod tests {
         });
 
         assert!(result.is_err());
-        assert_eq!(fs::read(destination).unwrap(), b"updated file");
+        assert_eq!(fs::read(destination_path).unwrap(), b"updated file");
         assert_eq!(fs::read(backup_path).unwrap(), b"original file");
     }
 
@@ -1120,6 +1168,311 @@ mod tests {
     }
 
     #[test]
+    fn apply_rejects_deleting_installed_record_through_directory_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let source = temp.path().join("source");
+        let package = temp.path().join("system.aup");
+        let deletion = temp.path().join("delete.aup");
+        fs::create_dir_all(root.join("usr/bin")).unwrap();
+        fs::create_dir_all(source.join("usr/bin")).unwrap();
+        fs::write(source.join("usr/bin/tool"), b"installed version").unwrap();
+        let (_, signing_key, public_key) = generate_keypair(&temp.path().join("keys")).unwrap();
+        trust_key(&public_key, &root).unwrap();
+        let mut pack_options = PackOptions {
+            source: source.clone(),
+            deletions: Vec::new(),
+            system_files: Vec::new(),
+            name: "system".into(),
+            version: "1".into(),
+            sequence: 10,
+            architecture: "any".into(),
+            description: "replay protection test".into(),
+            signing_key,
+            output: package.clone(),
+        };
+        create_pack(&pack_options).unwrap();
+        let options = |archive| ApplyOptions {
+            archive,
+            root: root.clone(),
+            supplied_key: None,
+            architecture: Some("x86_64".into()),
+            allow_downgrade: false,
+        };
+        apply(&options(package.clone())).unwrap();
+        let record_path = root.join("var/lib/arkup/installed/system.json");
+        let original_record = fs::read(&record_path).unwrap();
+        symlink("../var/lib/arkup/installed", root.join("usr/records")).unwrap();
+
+        // This signed pack passes lexical path validation. Its deletion resolves
+        // to another pack's replay record through an existing directory alias.
+        fs::write(source.join("usr/bin/tool"), b"replacement").unwrap();
+        pack_options.name = "other".into();
+        pack_options.sequence = 1;
+        pack_options.deletions = vec!["usr/records/system.json".into()];
+        pack_options.output = deletion.clone();
+        create_pack(&pack_options).unwrap();
+        let error = apply(&options(deletion)).unwrap_err();
+        assert!(format!("{error:#}").contains("protected path"));
+        assert_eq!(fs::read(&record_path).unwrap(), original_record);
+        assert_eq!(
+            fs::read(root.join("usr/bin/tool")).unwrap(),
+            b"installed version"
+        );
+        assert!(!root.join("var/lib/arkup/installed/other.json").exists());
+        let replay_error = apply(&options(package)).unwrap_err();
+        assert!(format!("{replay_error:#}").contains("not newer than installed sequence"));
+    }
+
+    #[test]
+    fn payload_operations_reject_aliases_to_protected_paths() {
+        for (directory, name) in [
+            ("etc", "ld.so.cache"),
+            ("etc/arkup", "key"),
+            ("etc/arkpkg", "key"),
+            ("var/lib/arkup/installed", "system.json"),
+            ("var/lib/arkpkg", "record"),
+            ("dev", "record"),
+            ("proc", "record"),
+            ("sys", "record"),
+            ("run", "record"),
+            ("tmp", "record"),
+            ("home", "record"),
+            ("var/cache", "record"),
+            ("var/log", "record"),
+            ("var/tmp", "record"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let backup = temp.path().join("backup");
+            fs::create_dir_all(root.join(directory)).unwrap();
+            fs::create_dir_all(root.join("usr")).unwrap();
+            fs::create_dir(&backup).unwrap();
+            let protected = root.join(directory).join(name);
+            fs::write(&protected, b"protected content").unwrap();
+            symlink(root.join(directory), root.join("usr/alias")).unwrap();
+            for (kind, config) in [
+                (EntryKind::File, false),
+                (EntryKind::File, true),
+                (EntryKind::Symlink, false),
+                (EntryKind::Delete, false),
+            ] {
+                let entry = UpdateEntry {
+                    path: format!("usr/alias/{name}"),
+                    kind,
+                    mode: 0o644,
+                    size: Some(3),
+                    sha256: Some(hex::encode(Sha256::digest(b"new"))),
+                    target: Some("tool".into()),
+                    config,
+                };
+                let mut changes = Vec::new();
+                let mut directories = Vec::new();
+                let result = match kind {
+                    EntryKind::File => apply_file(
+                        &root,
+                        &entry,
+                        &mut &b"new"[..],
+                        None,
+                        &backup,
+                        &mut changes,
+                        &mut directories,
+                    ),
+                    EntryKind::Symlink => apply_symlink(
+                        &root,
+                        &entry,
+                        &mut io::empty(),
+                        &backup,
+                        &mut changes,
+                        &mut directories,
+                    ),
+                    EntryKind::Delete => {
+                        apply_delete(&root, &entry, &mut io::empty(), None, &backup, &mut changes)
+                    }
+                };
+                let error = result.expect_err("protected alias must be rejected");
+                assert!(format!("{error:#}").contains("protected path"), "{error:#}");
+                assert_eq!(fs::read(&protected).unwrap(), b"protected content");
+                assert!(
+                    !protected
+                        .with_file_name(format!("{name}.arkup-new"))
+                        .exists()
+                );
+                assert!(changes.is_empty());
+                assert!(directories.is_empty());
+            }
+            if directory != "etc" {
+                assert!(
+                    resolve_destination(&root, "usr/alias/missing/tool", &mut Vec::new(), false)
+                        .is_err()
+                );
+                assert!(!root.join(directory).join("missing").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn protected_leaf_symlinks_do_not_protect_their_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let zoneinfo = root.join("usr/share/zoneinfo/UTC");
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::create_dir_all(zoneinfo.parent().unwrap()).unwrap();
+        fs::write(&zoneinfo, b"timezone data").unwrap();
+        symlink("../usr/share/zoneinfo/UTC", root.join("etc/localtime")).unwrap();
+
+        let destination =
+            resolve_destination(&root, "usr/share/zoneinfo/UTC", &mut Vec::new(), false).unwrap();
+
+        assert_eq!(destination.path, zoneinfo);
+    }
+
+    #[test]
+    fn protected_state_remains_protected_when_var_is_a_directory_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let state = root.join("usr/state/lib/arkup/installed");
+        fs::create_dir_all(&state).unwrap();
+        symlink("usr/state", root.join("var")).unwrap();
+        fs::write(state.join("system.json"), b"replay record").unwrap();
+        symlink("state/lib/arkup/installed", root.join("usr/records")).unwrap();
+        fs::create_dir(root.join("usr/config")).unwrap();
+        symlink("usr/config", root.join("etc")).unwrap();
+        for path in [
+            "usr/config/ld.so.cache",
+            "usr/state/lib/arkup/installed/system.json",
+            "usr/records/system.json",
+            "usr/state/lib/arkup/missing/tool",
+        ] {
+            let error = match resolve_destination(&root, path, &mut Vec::new(), false) {
+                Err(error) => error,
+                Ok(_) => panic!("physical state must remain protected"),
+            };
+            assert!(format!("{error:#}").contains("protected path"));
+            assert!(resolve_existing_destination(&root, path).is_err());
+        }
+        assert!(!root.join("var/lib/arkup/missing").exists());
+        assert_eq!(
+            fs::read(state.join("system.json")).unwrap(),
+            b"replay record"
+        );
+    }
+
+    #[test]
+    fn file_and_config_sidecar_remain_bound_to_checked_parent() {
+        struct SwapDirectoryReader {
+            content: io::Cursor<&'static [u8]>,
+            directory: PathBuf,
+            moved: PathBuf,
+            redirect: PathBuf,
+        }
+        impl Read for SwapDirectoryReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.content.position() == 0 {
+                    fs::rename(&self.directory, &self.moved)?;
+                    symlink(&self.redirect, &self.directory)?;
+                }
+                self.content.read(buffer)
+            }
+        }
+        for config in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let directory = root.join("usr/config");
+            let moved = root.join("usr/moved");
+            let protected = root.join("var/lib/arkup/installed");
+            let backup = temp.path().join("backup");
+            fs::create_dir_all(&directory).unwrap();
+            fs::create_dir_all(&protected).unwrap();
+            fs::create_dir(&backup).unwrap();
+            fs::write(directory.join("tool"), b"local content").unwrap();
+            fs::write(protected.join("tool"), b"protected content").unwrap();
+            fs::write(protected.join("tool.arkup-new"), b"protected sidecar").unwrap();
+            let entry = UpdateEntry {
+                path: "usr/config/tool".into(),
+                kind: EntryKind::File,
+                mode: 0o644,
+                size: Some(3),
+                sha256: Some(hex::encode(Sha256::digest(b"new"))),
+                target: None,
+                config,
+            };
+            let mut reader = SwapDirectoryReader {
+                content: io::Cursor::new(b"new"),
+                directory,
+                moved: moved.clone(),
+                redirect: protected.clone(),
+            };
+            let mut changes = Vec::new();
+            let mut directories = Vec::new();
+            apply_file(
+                &root,
+                &entry,
+                &mut reader,
+                None,
+                &backup,
+                &mut changes,
+                &mut directories,
+            )
+            .unwrap();
+            let installed_name = if config { "tool.arkup-new" } else { "tool" };
+            assert_eq!(fs::read(moved.join(installed_name)).unwrap(), b"new");
+            assert_eq!(
+                fs::read(protected.join("tool")).unwrap(),
+                b"protected content"
+            );
+            assert_eq!(
+                fs::read(protected.join("tool.arkup-new")).unwrap(),
+                b"protected sidecar"
+            );
+            rollback(&changes, &directories).unwrap();
+            assert_eq!(fs::read(moved.join("tool")).unwrap(), b"local content");
+            assert!(!moved.join("tool.arkup-new").exists());
+            assert_eq!(
+                fs::read(protected.join("tool")).unwrap(),
+                b"protected content"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_alias_supports_replacement_deletion_and_rollback_after_parent_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let original = root.join("usr/lib");
+        let moved = root.join("usr/moved");
+        let protected = root.join("var/lib/arkup/installed");
+        let backup = temp.path().join("backup");
+        fs::create_dir_all(&original).unwrap();
+        fs::create_dir_all(&protected).unwrap();
+        fs::create_dir(&backup).unwrap();
+        fs::write(original.join("tool"), b"original").unwrap();
+        fs::write(protected.join("tool"), b"protected").unwrap();
+        symlink("usr/lib", root.join("lib")).unwrap();
+        let destination = resolve_existing_destination(&root, "lib/tool")
+            .unwrap()
+            .unwrap();
+        let saved = snapshot_existing(&root, &destination, "lib/tool", &backup).unwrap();
+        fs::rename(&original, &moved).unwrap();
+        symlink(&protected, &original).unwrap();
+        let staged = destination.stage_symlink(Path::new("other-tool")).unwrap();
+        staged.persist(&destination).unwrap();
+        assert_eq!(
+            fs::read_link(moved.join("tool")).unwrap(),
+            Path::new("other-tool")
+        );
+        destination.remove(AtFlags::empty()).unwrap();
+        assert!(fs::symlink_metadata(moved.join("tool")).is_err());
+        restore_change(&AppliedChange {
+            destination,
+            backup: saved,
+        })
+        .unwrap();
+        assert_eq!(fs::read(moved.join("tool")).unwrap(), b"original");
+        assert_eq!(fs::read(protected.join("tool")).unwrap(), b"protected");
+    }
+
+    #[test]
     fn install_rejects_directory_symlink_escape() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -1127,7 +1480,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&outside).unwrap();
         symlink(&outside, root.join("usr")).unwrap();
-        assert!(resolve_destination(&root, "usr/bin/tool", &mut Vec::new()).is_err());
+        assert!(resolve_destination(&root, "usr/bin/tool", &mut Vec::new(), false).is_err());
     }
 
     #[test]
