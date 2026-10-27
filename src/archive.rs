@@ -401,6 +401,7 @@ pub fn verify_archive_with_key(
                     "expected symlink at '{}'",
                     relative
                 );
+                ensure!(entry.size() == 0, "symlink payload must be empty");
                 let actual_target = archive_link_target(&entry)?;
                 ensure!(
                     Some(actual_target.as_str()) == expected.target.as_deref(),
@@ -501,6 +502,7 @@ pub fn for_each_payload(
                     "expected symlink at '{}'",
                     relative
                 );
+                ensure!(entry.size() == 0, "symlink payload must be empty");
                 let target = archive_link_target(&entry)?;
                 ensure!(
                     Some(target.as_str()) == expected_entry.target.as_deref(),
@@ -977,11 +979,11 @@ mod tests {
             header.set_mtime(0);
             if entry.kind.is_symlink() {
                 header.set_entry_type(EntryType::Symlink);
-                header.set_size(0);
+                header.set_size(entry.data.len() as u64);
                 header.set_link_name(entry.link.unwrap()).unwrap();
                 header.set_cksum();
                 builder
-                    .append_data(&mut header, entry.path, io::empty())
+                    .append_data(&mut header, entry.path, entry.data.as_slice())
                     .unwrap();
             } else {
                 header.set_entry_type(EntryType::Regular);
@@ -1128,6 +1130,41 @@ mod tests {
         });
 
         assert!(verify_archive_with_key(&duplicate, &signing.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn rejects_nonempty_symlink_bodies_in_every_archive_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let package = temp.path().join("original.aup");
+        let malicious = temp.path().join("symlink-body.aup");
+        let signing_path = temp.path().join("signing.key");
+        fs::create_dir_all(source.join("usr/bin")).unwrap();
+        symlink("tool", source.join("usr/bin/tool-link")).unwrap();
+        let signing = signing_key();
+        write_key(&signing_path, &signing);
+        let manifest = create_pack(&test_options(&source, &package, &signing_path)).unwrap();
+
+        rewrite_archive(&package, &malicious, |_, _, entries| {
+            let symlink = entries
+                .iter_mut()
+                .find(|entry| entry.kind.is_symlink())
+                .unwrap();
+            symlink.data.push(b'x');
+        });
+
+        let verification =
+            verify_archive_with_key(&malicious, &signing.verifying_key()).unwrap_err();
+        assert!(format!("{verification:#}").contains("symlink payload must be empty"));
+
+        let mut symlink_callback = false;
+        let traversal = for_each_payload(&malicious, &manifest, |entry, _| {
+            symlink_callback |= entry.kind == EntryKind::Symlink;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{traversal:#}").contains("symlink payload must be empty"));
+        assert!(!symlink_callback);
     }
 
     #[test]
