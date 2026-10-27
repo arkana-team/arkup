@@ -75,7 +75,7 @@ impl UpdateManifest {
         for entry in &self.entries {
             validate_path(&entry.path)?;
             ensure!(
-                !is_protected_path(&entry.path),
+                !is_protected_destination(&entry.path),
                 "update pack may not write protected path '{}'",
                 entry.path
             );
@@ -150,7 +150,7 @@ impl UpdateManifest {
                     entry.path
                 );
                 ensure!(
-                    !is_protected_path(&sidecar),
+                    !is_protected_destination(&sidecar),
                     "configuration update '{}' has a protected .arkup-new sidecar",
                     entry.path
                 );
@@ -311,6 +311,15 @@ pub fn is_protected_path(value: &str) -> bool {
     })
 }
 
+// Traversal through an ordinary ancestor is allowed, but replacing that final
+// directory entry would detach the protected namespace beneath it.
+pub fn is_protected_destination(value: &str) -> bool {
+    is_protected_path(value)
+        || PROTECTED_PATHS
+            .iter()
+            .any(|protected| Path::new(protected).starts_with(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +339,39 @@ mod tests {
         assert!(is_protected_path("var/lib/arkup/installed/system.json"));
         assert!(is_protected_path("dev/null"));
         assert!(!is_protected_path("usr/lib/libc.so.6"));
+    }
+
+    #[test]
+    fn manifests_reject_mutations_of_protected_ancestors() {
+        for path in ["etc", "var", "usr"] {
+            for kind in [EntryKind::File, EntryKind::Symlink, EntryKind::Delete] {
+                let manifest = UpdateManifest {
+                    format_version: FORMAT_VERSION,
+                    name: "system".into(),
+                    version: "1".into(),
+                    sequence: 1,
+                    architecture: "any".into(),
+                    description: "ancestor mutation".into(),
+                    key_id: "0".repeat(64),
+                    entries: vec![UpdateEntry {
+                        path: path.into(),
+                        kind,
+                        mode: if kind == EntryKind::Delete { 0 } else { 0o644 },
+                        size: (kind == EntryKind::File).then_some(0),
+                        sha256: (kind == EntryKind::File).then(|| "0".repeat(64)),
+                        target: (kind == EntryKind::Symlink).then(|| "replacement".into()),
+                        config: false,
+                    }],
+                };
+                let error = manifest
+                    .validate()
+                    .expect_err("ancestor mutation must be rejected");
+                assert!(
+                    error.to_string().contains("protected path"),
+                    "{path}: {error:#}"
+                );
+            }
+        }
     }
 
     #[test]
