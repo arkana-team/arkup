@@ -657,12 +657,26 @@ fn rollback(changes: &[AppliedChange], created_directories: &[PathBuf]) -> Resul
 }
 
 fn restore_change(change: &AppliedChange) -> Result<()> {
+    restore_change_with_owner(change, |file, metadata| {
+        fchown(file, Some(metadata.uid()), Some(metadata.gid())).context("cannot restore ownership")
+    })
+}
+
+fn restore_change_with_owner(
+    change: &AppliedChange,
+    restore_owner: impl FnOnce(&File, &fs::Metadata) -> Result<()>,
+) -> Result<()> {
+    let remove_destination = change
+        .backup
+        .as_ref()
+        .is_none_or(|backup| backup.metadata.file_type().is_symlink());
     match fs::symlink_metadata(&change.destination) {
         Ok(metadata) if metadata.is_dir() => bail!(
             "cannot remove directory while rolling back {}",
             change.destination.display()
         ),
-        Ok(_) => fs::remove_file(&change.destination)?,
+        Ok(_) if remove_destination => fs::remove_file(&change.destination)?,
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
@@ -679,8 +693,7 @@ fn restore_change(change: &AppliedChange) -> Result<()> {
             io::copy(&mut File::open(&backup.path)?, staged.as_file_mut())?;
             // Keep the temporary file private until ownership is restored.
             // chown can clear setuid/setgid bits, so apply the saved mode last.
-            fchown(staged.as_file(), Some(metadata.uid()), Some(metadata.gid()))
-                .context("cannot restore ownership")?;
+            restore_owner(staged.as_file(), metadata)?;
             staged.as_file().set_permissions(metadata.permissions())?;
             staged
                 .persist(&change.destination)
@@ -808,6 +821,31 @@ mod tests {
     use crate::archive::{PackOptions, create_pack};
     use crate::key::generate_keypair;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn failed_owner_restore_keeps_destination_and_recovery_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("installed-file");
+        let backup_path = temp.path().join("original-file");
+        fs::write(&destination, b"updated file").unwrap();
+        fs::write(&backup_path, b"original file").unwrap();
+        let backup = Snapshot {
+            metadata: fs::symlink_metadata(&backup_path).unwrap(),
+            path: backup_path.clone(),
+        };
+        let change = AppliedChange {
+            destination: destination.clone(),
+            backup: Some(backup),
+        };
+
+        let result = restore_change_with_owner(&change, |_, _| {
+            bail!("simulated ownership restoration failure")
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(destination).unwrap(), b"updated file");
+        assert_eq!(fs::read(backup_path).unwrap(), b"original file");
+    }
 
     #[test]
     fn trust_creates_keys_and_checks_existing_contents() {
