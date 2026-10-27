@@ -352,7 +352,7 @@ pub fn verify_archive_with_key(
         let archive_path = archive_path_string(&entry)?;
         ensure!(
             archive_path.starts_with(PAYLOAD_PREFIX),
-            "unexpected update archive entry '{}'",
+            "unexpected update archive entry {:?}",
             archive_path
         );
         let relative = &archive_path[PAYLOAD_PREFIX.len()..];
@@ -475,7 +475,7 @@ pub fn for_each_payload(
         let archive_path = archive_path_string(&entry)?;
         let relative = archive_path
             .strip_prefix(PAYLOAD_PREFIX)
-            .ok_or_else(|| anyhow::anyhow!("unexpected archive entry '{}'", archive_path))?;
+            .ok_or_else(|| anyhow::anyhow!("unexpected archive entry {:?}", archive_path))?;
         validate_path(relative)?;
         ensure!(
             seen.insert(relative.to_string()),
@@ -1111,6 +1111,55 @@ mod tests {
             entries[0].data[0] ^= 0x01;
         });
         assert!(verify_archive_with_key(&bad_payload, &signing.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn escapes_unexpected_archive_names_in_every_archive_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let package = temp.path().join("original.aup");
+        let malicious = temp.path().join("unexpected.aup");
+        let signing_path = temp.path().join("signing.key");
+        fs::create_dir_all(source.join("usr/bin")).unwrap();
+        fs::write(source.join("usr/bin/tool"), b"signed bytes").unwrap();
+        let signing = signing_key();
+        write_key(&signing_path, &signing);
+        let manifest = create_pack(&test_options(&source, &package, &signing_path)).unwrap();
+
+        // Exercise both a normal tar header and a GNU long-name extension.
+        for prefix in ["unexpected".to_string(), "unexpected".repeat(12)] {
+            let name = format!("{prefix}\narkup: forged success\r\t\x1b[2J\u{7f}\u{85}");
+            // Keep the authentic manifest and signature byte-for-byte unchanged.
+            rewrite_archive(&package, &malicious, |_, _, entries| {
+                entries[0].path = name;
+            });
+
+            let mut callback_called = false;
+            let errors = [
+                verify_archive_with_key(&malicious, &signing.verifying_key()).unwrap_err(),
+                for_each_payload(&malicious, &manifest, |_, _| {
+                    callback_called = true;
+                    Ok(())
+                })
+                .unwrap_err(),
+            ];
+            assert!(!callback_called);
+            for error in errors {
+                let diagnostic = format!("{error:#}");
+                assert!(diagnostic.contains("archive entry"), "{diagnostic:?}");
+                assert!(!diagnostic.chars().any(char::is_control), "{diagnostic:?}");
+                for escaped in [
+                    r"\narkup: forged success",
+                    r"\r",
+                    r"\t",
+                    r"\u{1b}[2J",
+                    r"\u{7f}",
+                    r"\u{85}",
+                ] {
+                    assert!(diagnostic.contains(escaped), "{diagnostic:?}");
+                }
+            }
+        }
     }
 
     #[test]
