@@ -409,6 +409,41 @@ mod tests {
     }
 
     #[test]
+    fn system_update_requires_managed_build_number_matching_sequence() {
+        let build_number = b"12\n";
+        let mut manifest = UpdateManifest {
+            format_version: FORMAT_VERSION,
+            name: "arkanaos-system".into(),
+            version: "arkanaOS 1.0 (alpha 1) build 12".into(),
+            sequence: 12,
+            base_sequence: Some(11),
+            system_update: true,
+            architecture: "x86_64".into(),
+            description: "weekly system update".into(),
+            key_id: "0011223344556677001122334455667700112233445566770011223344556677".into(),
+            entries: vec![UpdateEntry {
+                path: "etc/arkana-build-number".into(),
+                kind: EntryKind::File,
+                mode: 0o644,
+                size: Some(build_number.len() as u64),
+                sha256: Some(format!("{:x}", Sha256::digest(build_number))),
+                target: None,
+                config: false,
+            }],
+        };
+
+        assert!(manifest.validate().is_ok());
+        manifest.entries[0].config = true;
+        assert!(manifest.validate().is_err());
+        manifest.entries[0].config = false;
+        manifest.entries[0].sha256 = Some(format!("{:x}", Sha256::digest(b"13\n")));
+        assert!(manifest.validate().is_err());
+        manifest.entries[0].sha256 = Some(format!("{:x}", Sha256::digest(build_number)));
+        manifest.entries[0].size = Some(4);
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
     fn manifest_requires_sorted_unique_paths() {
         let mut manifest = UpdateManifest {
             format_version: FORMAT_VERSION,
