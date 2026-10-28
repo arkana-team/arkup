@@ -88,6 +88,85 @@ fn pack_help_documents_base_sequence_binding() {
     let output = arkup().args(["pack", "--help"]).output().unwrap();
     let stdout = success(output);
     assert!(stdout.contains("--base-sequence"));
+    assert!(stdout.contains("--system-update"));
+}
+
+#[test]
+fn system_update_requires_matching_non_config_build_number() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let keys = temp.path().join("keys");
+    let output = temp.path().join("system.aup");
+    fs::create_dir_all(source.join("etc")).unwrap();
+    fs::write(source.join("etc/arkana-build-number"), b"11\n").unwrap();
+    let keygen = arkup()
+        .args(["keygen", "--output-dir", keys.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let keygen = success(keygen);
+    let key_id = keygen
+        .lines()
+        .find_map(|line| line.strip_prefix("key id: "))
+        .unwrap();
+    let signing_key = keys.join(format!("{key_id}.key"));
+
+    let mut command = arkup();
+    command.args([
+        "pack",
+        "--source",
+        source.to_str().unwrap(),
+        "--name",
+        "arkanaos-system",
+        "--version",
+        "arkanaOS 1.0 (alpha 1) build 12",
+        "--sequence",
+        "12",
+        "--base-sequence",
+        "10",
+        "--system-update",
+        "--system-file",
+        "etc/arkana-build-number",
+        "--arch",
+        "x86_64",
+        "--description",
+        "system update test",
+        "--signing-key",
+        signing_key.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    let rejected = command.output().unwrap();
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("must match manifest sequence 12"));
+
+    fs::write(source.join("etc/arkana-build-number"), b"12\n").unwrap();
+    let mut command = arkup();
+    command.args([
+        "pack",
+        "--source",
+        source.to_str().unwrap(),
+        "--name",
+        "arkanaos-system",
+        "--version",
+        "arkanaOS 1.0 (alpha 1) build 12",
+        "--sequence",
+        "12",
+        "--base-sequence",
+        "10",
+        "--system-update",
+        "--system-file",
+        "etc/arkana-build-number",
+        "--arch",
+        "x86_64",
+        "--description",
+        "system update test",
+        "--signing-key",
+        signing_key.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    success(command.output().unwrap());
+    assert!(output.is_file());
 }
 
 #[test]

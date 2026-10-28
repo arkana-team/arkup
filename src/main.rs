@@ -47,6 +47,9 @@ enum Command {
         /// Require the installed system build to match this update's base.
         #[arg(long)]
         base_sequence: Option<u64>,
+        /// Mark this as a core system update and validate its target build number.
+        #[arg(long)]
+        system_update: bool,
         #[arg(long, default_value = "any")]
         arch: String,
         #[arg(long)]
@@ -114,6 +117,7 @@ fn run() -> Result<()> {
             version,
             sequence,
             base_sequence,
+            system_update,
             arch,
             description,
             signing_key,
@@ -127,6 +131,7 @@ fn run() -> Result<()> {
                 version,
                 sequence,
                 base_sequence,
+                system_update,
                 architecture: arch,
                 description,
                 signing_key,

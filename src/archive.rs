@@ -46,6 +46,7 @@ pub struct PackOptions {
     pub version: String,
     pub sequence: u64,
     pub base_sequence: Option<u64>,
+    pub system_update: bool,
     pub architecture: String,
     pub description: String,
     pub signing_key: PathBuf,
@@ -66,6 +67,10 @@ pub fn create_pack(options: &PackOptions) -> Result<UpdateManifest> {
     ensure!(
         valid_atom(&options.architecture),
         "invalid update pack architecture"
+    );
+    ensure!(
+        !options.system_update || options.base_sequence.is_some(),
+        "system update packs must declare a base sequence"
     );
     ensure!(
         options.output.extension().and_then(|ext| ext.to_str()) == Some("aup"),
@@ -202,6 +207,7 @@ pub fn create_pack(options: &PackOptions) -> Result<UpdateManifest> {
         version: options.version.clone(),
         sequence: options.sequence,
         base_sequence: options.base_sequence,
+        system_update: options.system_update,
         architecture: options.architecture.clone(),
         description: options.description.clone(),
         key_id,
@@ -899,11 +905,61 @@ mod tests {
             version: "1.2.3".into(),
             sequence: 1,
             base_sequence: None,
+            system_update: false,
             architecture: "any".into(),
             description: "feature pack test".into(),
             signing_key: private_key.to_path_buf(),
             output: output.to_path_buf(),
         }
+    }
+
+    #[test]
+    fn system_update_pack_binds_build_number_to_manifest_sequence() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("etc")).unwrap();
+        fs::write(source.join("etc/arkana-build-number"), b"42\n").unwrap();
+        let key_path = temp.path().join("release.key");
+        write_key(&key_path, &signing_key());
+        let mut options = test_options(&source, &temp.path().join("system.aup"), &key_path);
+        options.sequence = 42;
+        options.base_sequence = Some(41);
+        options.system_update = true;
+        options.system_files.push("etc/arkana-build-number".into());
+
+        let manifest = create_pack(&options).unwrap();
+
+        assert!(manifest.system_update);
+        let build_number = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "etc/arkana-build-number")
+            .unwrap();
+        assert!(!build_number.config);
+        assert_eq!(build_number.size, Some(3));
+    }
+
+    #[test]
+    fn base_bound_feature_pack_does_not_require_os_build_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("usr/bin")).unwrap();
+        fs::write(source.join("usr/bin/tool"), b"feature update").unwrap();
+        let key_path = temp.path().join("release.key");
+        write_key(&key_path, &signing_key());
+        let mut options = test_options(&source, &temp.path().join("feature.aup"), &key_path);
+        options.sequence = 42;
+        options.base_sequence = Some(41);
+
+        let manifest = create_pack(&options).unwrap();
+
+        assert!(!manifest.system_update);
+        assert!(
+            manifest
+                .entries
+                .iter()
+                .all(|entry| { entry.path != "etc/arkana-build-number" })
+        );
     }
 
     fn write_key(path: &Path, key: &SigningKey) {

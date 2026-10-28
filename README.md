@@ -38,6 +38,7 @@ arkup pack \
   --version 'arkanaOS 1.0 (alpha 1) build 891' \
   --sequence 891 \
   --base-sequence 890 \
+  --system-update \
   --arch x86_64 \
   --system-file etc/os-release \
   --system-file etc/arkana-build-number \
@@ -56,11 +57,12 @@ For a test root, pass `--root /path/to/root` to `trust`, `verify`, `list`, or
 trust store. Applying an older sequence requires the explicit
 `--allow-downgrade` option.
 
-System update packs should set `--base-sequence` to the installed build from
-which the delta was created. arkup checks `/etc/arkana-build-number` before
-applying payload changes and rejects a pack if the installed build does not
-match. This prevents applying a weekly delta after skipping its matching base
-release.
+System update packs must set `--system-update` and `--base-sequence` to the
+installed build from which the delta was created. arkup requires the signed
+`etc/arkana-build-number` entry to be a system-managed regular file whose
+content matches the manifest sequence, then checks the installed build before
+applying payload changes. This prevents applying a weekly delta after skipping
+its matching base release or leaving the installed build identity stale.
 
 Trust import requires directory ancestry owned by root or the invoking user,
 without group or other write access. Sticky directories above the target root
@@ -77,8 +79,9 @@ protected mutable paths, including `/etc/ld.so.cache`, `/var/lib`, `/root`, and
 local timezone and resolver links.
 
 The optional signed `base_sequence` manifest field binds a delta to an exact
-installed system build. Packs without that field remain applicable for
-backward compatibility.
+installed system build. The explicit `system_update` marker adds the OS build
+identity contract. Unmarked base-bound feature packs retain their existing
+behavior, and older packs without these fields remain applicable.
 
 Repeat `--delete PATH` to remove retired files. Existing files are backed up;
 edited configuration files are retained when a deletion is applied. Repeat

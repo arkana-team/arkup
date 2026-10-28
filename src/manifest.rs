@@ -1,5 +1,6 @@
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
@@ -17,6 +18,8 @@ pub struct UpdateManifest {
     pub sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub system_update: bool,
     pub architecture: String,
     pub description: String,
     pub key_id: String,
@@ -64,6 +67,10 @@ impl UpdateManifest {
                 self.sequence
             );
         }
+        ensure!(
+            !self.system_update || self.base_sequence.is_some(),
+            "system update packs must declare a base sequence"
+        );
         ensure!(
             valid_atom(&self.architecture),
             "invalid update pack architecture"
@@ -151,6 +158,24 @@ impl UpdateManifest {
             }
         }
 
+        if self.system_update {
+            let build_number = paths.get("etc/arkana-build-number").ok_or_else(|| {
+                anyhow::anyhow!("system update is missing etc/arkana-build-number")
+            })?;
+            ensure!(
+                build_number.kind == EntryKind::File && !build_number.config,
+                "system update etc/arkana-build-number must be a non-config regular file"
+            );
+            let expected = format!("{}\n", self.sequence);
+            let expected_sha256 = format!("{:x}", Sha256::digest(expected.as_bytes()));
+            ensure!(
+                build_number.size == Some(expected.len() as u64)
+                    && build_number.sha256.as_deref() == Some(expected_sha256.as_str()),
+                "system update etc/arkana-build-number must match manifest sequence {}",
+                self.sequence
+            );
+        }
+
         for entry in &self.entries {
             if entry.config && entry.kind == EntryKind::File {
                 let sidecar = format!("{}.arkup-new", entry.path);
@@ -192,6 +217,10 @@ impl UpdateManifest {
         }
         Ok(())
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 pub fn valid_name(value: &str) -> bool {
@@ -360,6 +389,7 @@ mod tests {
             version: "arkanaOS 1.0 (alpha 1) build 12".into(),
             sequence: 12,
             base_sequence: Some(12),
+            system_update: false,
             architecture: "x86_64".into(),
             description: "weekly system update".into(),
             key_id: "0011223344556677001122334455667700112233445566770011223344556677".into(),
@@ -386,6 +416,7 @@ mod tests {
             version: "1.0.1".into(),
             sequence: 1,
             base_sequence: None,
+            system_update: false,
             architecture: "x86_64".into(),
             description: "system update".into(),
             key_id: "0011223344556677001122334455667700112233445566770011223344556677".into(),
@@ -413,6 +444,12 @@ mod tests {
         assert!(manifest.validate().is_err());
         manifest.entries.reverse();
         assert!(manifest.validate().is_ok());
+        assert!(
+            serde_json::to_value(&manifest)
+                .unwrap()
+                .get("system_update")
+                .is_none()
+        );
     }
 
     #[test]
@@ -432,6 +469,7 @@ mod tests {
             version: "arkanaOS 1.0 (alpha 1) build 891".into(),
             sequence: 891,
             base_sequence: None,
+            system_update: false,
             architecture: "x86_64".into(),
             description: "system update".into(),
             key_id: "0011223344556677001122334455667700112233445566770011223344556677".into(),
@@ -469,6 +507,7 @@ mod tests {
             version: "1.0.1".into(),
             sequence: 1,
             base_sequence: None,
+            system_update: false,
             architecture: "x86_64".into(),
             description: "system update".into(),
             key_id: "0011223344556677001122334455667700112233445566770011223344556677".into(),
