@@ -95,6 +95,15 @@ pub fn apply(options: &ApplyOptions) -> Result<UpdateManifest> {
         .join("var/lib/arkup/installed")
         .join(format!("{}.json", manifest.name));
     let previous = read_record(&record_path, &manifest.name)?;
+    if let Some(base_sequence) = manifest.base_sequence {
+        let installed_sequence = read_installed_build_sequence(&root)?;
+        ensure!(
+            installed_sequence == base_sequence,
+            "update package requires base build {}, but installed system is at build {}",
+            base_sequence,
+            installed_sequence
+        );
+    }
     if let Some(record) = &previous {
         ensure!(
             options.allow_downgrade || manifest.sequence > record.sequence,
@@ -748,6 +757,49 @@ fn restore_change_with_owner(
     Ok(())
 }
 
+fn read_installed_build_sequence(root: &Path) -> Result<u64> {
+    let root_directory = open_trust_path(
+        File::open("/")?,
+        root.strip_prefix("/")
+            .context("target root must be an absolute path")?,
+        true,
+    )?;
+    let etc_directory = open_at(
+        &root_directory,
+        OsStr::new("etc"),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    )
+    .context("cannot open target /etc directory without following symlinks")?;
+    let file = open_at(
+        &etc_directory,
+        OsStr::new("arkana-build-number"),
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        0,
+    )
+    .context("cannot open target /etc/arkana-build-number without following symlinks")?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= 32,
+        "target /etc/arkana-build-number must be a regular file of at most 32 bytes"
+    );
+    let mut contents = Vec::new();
+    file.take(33).read_to_end(&mut contents)?;
+    ensure!(
+        contents.len() <= 32,
+        "target /etc/arkana-build-number is too large"
+    );
+    let text = std::str::from_utf8(&contents).context("target build number is not UTF-8")?;
+    let digits = text.strip_suffix('\n').unwrap_or(text);
+    ensure!(
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+        "target /etc/arkana-build-number is invalid"
+    );
+    digits
+        .parse::<u64>()
+        .context("target /etc/arkana-build-number is outside the supported range")
+}
+
 fn read_record(path: &Path, expected_name: &str) -> Result<Option<InstalledRecord>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -774,6 +826,8 @@ fn read_record(path: &Path, expected_name: &str) -> Result<Option<InstalledRecor
         name: record.name.clone(),
         version: record.version.clone(),
         sequence: record.sequence,
+        base_sequence: None,
+        system_update: false,
         architecture: "any".into(),
         description: "installed state".into(),
         key_id: record.key_id.clone(),
@@ -1029,6 +1083,8 @@ mod tests {
             name: "arkanaos-system".into(),
             version: "arkanaOS 1.0 (alpha 1) build 10".into(),
             sequence: 10,
+            base_sequence: None,
+            system_update: false,
             architecture: "any".into(),
             description: "test system update".into(),
             signing_key: key_dir.join(format!("{key_id}.key")),
@@ -1069,6 +1125,130 @@ mod tests {
     }
 
     #[test]
+    fn apply_rejects_mismatched_base_sequence_before_changing_system_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let root = temp.path().join("root");
+        let key_dir = temp.path().join("keys");
+        let package = temp.path().join("weekly.aup");
+        fs::create_dir_all(source.join("etc")).unwrap();
+        fs::create_dir_all(source.join("usr/bin")).unwrap();
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::create_dir_all(root.join("usr/bin")).unwrap();
+        fs::write(source.join("etc/arkana-build-number"), b"12\n").unwrap();
+        fs::write(source.join("usr/bin/arkana"), b"new system").unwrap();
+        fs::write(root.join("etc/arkana-build-number"), b"10\n").unwrap();
+        fs::write(root.join("usr/bin/arkana"), b"installed system").unwrap();
+        let (key_id, signing_key, public_key) = generate_keypair(&key_dir).unwrap();
+        create_pack(&PackOptions {
+            source,
+            deletions: Vec::new(),
+            system_files: vec!["etc/arkana-build-number".into()],
+            name: "arkanaos-system".into(),
+            version: "arkanaOS 1.0 (alpha 1) build 12".into(),
+            sequence: 12,
+            base_sequence: Some(9),
+            system_update: true,
+            architecture: "x86_64".into(),
+            description: "weekly system update".into(),
+            signing_key,
+            output: package.clone(),
+        })
+        .unwrap();
+        fs::create_dir_all(root.join("etc/arkup/trustedkeys.d")).unwrap();
+        fs::copy(
+            public_key,
+            root.join(format!("etc/arkup/trustedkeys.d/{key_id}.pub")),
+        )
+        .unwrap();
+
+        let error = apply(&ApplyOptions {
+            archive: package,
+            root: root.clone(),
+            supplied_key: None,
+            architecture: Some("x86_64".into()),
+            allow_downgrade: false,
+        })
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains(
+                "update package requires base build 9, but installed system is at build 10"
+            )
+        );
+        assert_eq!(
+            fs::read(root.join("etc/arkana-build-number")).unwrap(),
+            b"10\n"
+        );
+        assert_eq!(
+            fs::read(root.join("usr/bin/arkana")).unwrap(),
+            b"installed system"
+        );
+        assert!(
+            !root
+                .join("var/lib/arkup/installed/arkanaos-system.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn apply_accepts_matching_base_sequence_and_advances_system_build_number() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let root = temp.path().join("root");
+        let key_dir = temp.path().join("keys");
+        let package = temp.path().join("weekly.aup");
+        fs::create_dir_all(source.join("etc")).unwrap();
+        fs::create_dir_all(source.join("usr/bin")).unwrap();
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::create_dir_all(root.join("usr/bin")).unwrap();
+        fs::write(source.join("etc/arkana-build-number"), b"12\n").unwrap();
+        fs::write(source.join("usr/bin/arkana"), b"new system").unwrap();
+        fs::write(root.join("etc/arkana-build-number"), b"10\n").unwrap();
+        fs::write(root.join("usr/bin/arkana"), b"installed system").unwrap();
+        let (key_id, signing_key, public_key) = generate_keypair(&key_dir).unwrap();
+        create_pack(&PackOptions {
+            source,
+            deletions: Vec::new(),
+            system_files: vec!["etc/arkana-build-number".into()],
+            name: "arkanaos-system".into(),
+            version: "arkanaOS 1.0 (alpha 1) build 12".into(),
+            sequence: 12,
+            base_sequence: Some(10),
+            system_update: true,
+            architecture: "x86_64".into(),
+            description: "weekly system update".into(),
+            signing_key,
+            output: package.clone(),
+        })
+        .unwrap();
+        fs::create_dir_all(root.join("etc/arkup/trustedkeys.d")).unwrap();
+        fs::copy(
+            public_key,
+            root.join(format!("etc/arkup/trustedkeys.d/{key_id}.pub")),
+        )
+        .unwrap();
+
+        apply(&ApplyOptions {
+            archive: package,
+            root: root.clone(),
+            supplied_key: None,
+            architecture: Some("x86_64".into()),
+            allow_downgrade: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read(root.join("etc/arkana-build-number")).unwrap(),
+            b"12\n"
+        );
+        assert_eq!(
+            fs::read(root.join("usr/bin/arkana")).unwrap(),
+            b"new system"
+        );
+    }
+
+    #[test]
     fn failed_update_restores_files_and_rejects_replay() {
         check_failed_update_restores_files(None);
     }
@@ -1098,6 +1278,8 @@ mod tests {
             name: "arkanaos-system".into(),
             version: "1.0.1".into(),
             sequence: 1,
+            base_sequence: None,
+            system_update: false,
             architecture: "any".into(),
             description: "first test update".into(),
             signing_key: signing.clone(),
@@ -1140,6 +1322,8 @@ mod tests {
             name: "arkanaos-system".into(),
             version: "1.0.2".into(),
             sequence: 2,
+            base_sequence: None,
+            system_update: false,
             architecture: "any".into(),
             description: "second test update".into(),
             signing_key: signing,
@@ -1186,6 +1370,8 @@ mod tests {
             name: "system".into(),
             version: "1".into(),
             sequence: 10,
+            base_sequence: None,
+            system_update: false,
             architecture: "any".into(),
             description: "replay protection test".into(),
             signing_key,
@@ -1505,6 +1691,8 @@ mod tests {
             name: "arkanaos-system".into(),
             version: "arkanaOS 1.0 (alpha 1) build 1".into(),
             sequence: 1,
+            base_sequence: None,
+            system_update: false,
             architecture: "any".into(),
             description: "replace a symlink safely".into(),
             signing_key,
@@ -1560,6 +1748,8 @@ mod tests {
             name: "arkanaos-system".into(),
             version: "1.0.1".into(),
             sequence: 1,
+            base_sequence: None,
+            system_update: false,
             architecture: "x86_64".into(),
             description: "x86_64 update".into(),
             signing_key,
@@ -1606,6 +1796,8 @@ mod tests {
             name: "arkanaos-system".into(),
             version: "1.0.1".into(),
             sequence: 1,
+            base_sequence: None,
+            system_update: false,
             architecture: "any".into(),
             description: "initial files".into(),
             signing_key: signing.clone(),
@@ -1639,6 +1831,8 @@ mod tests {
             name: "arkanaos-system".into(),
             version: "1.0.2".into(),
             sequence: 2,
+            base_sequence: None,
+            system_update: false,
             architecture: "any".into(),
             description: "remove retired files".into(),
             signing_key: signing,
