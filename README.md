@@ -58,8 +58,9 @@ trust store. Applying an older sequence requires the explicit
 
 System update packs should set `--base-sequence` to the installed build from
 which the delta was created. arkup checks `/etc/arkana-build-number` before
-changing any files and rejects a pack if the installed build does not match.
-This prevents applying a weekly delta after skipping its matching base release.
+applying payload changes and rejects a pack if the installed build does not
+match. This prevents applying a weekly delta after skipping its matching base
+release.
 
 Trust import requires directory ancestry owned by root or the invoking user,
 without group or other write access. Sticky directories above the target root
