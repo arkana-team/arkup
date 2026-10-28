@@ -450,6 +450,9 @@ mod tests {
                 .get("system_update")
                 .is_none()
         );
+        let legacy_manifest: UpdateManifest =
+            serde_json::from_value(serde_json::to_value(&manifest).unwrap()).unwrap();
+        assert!(!legacy_manifest.system_update);
     }
 
     #[test]
