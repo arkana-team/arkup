@@ -37,6 +37,7 @@ arkup pack \
   --name arkanaos-system \
   --version 'arkanaOS 1.0 (alpha 1) build 891' \
   --sequence 891 \
+  --base-sequence 890 \
   --arch x86_64 \
   --system-file etc/os-release \
   --system-file etc/arkana-build-number \
@@ -55,6 +56,11 @@ For a test root, pass `--root /path/to/root` to `trust`, `verify`, `list`, or
 trust store. Applying an older sequence requires the explicit
 `--allow-downgrade` option.
 
+System update packs should set `--base-sequence` to the installed build from
+which the delta was created. arkup checks `/etc/arkana-build-number` before
+changing any files and rejects a pack if the installed build does not match.
+This prevents applying a weekly delta after skipping its matching base release.
+
 Trust import requires directory ancestry owned by root or the invoking user,
 without group or other write access. Sticky directories above the target root
 (such as `/tmp`) are allowed.
@@ -68,6 +74,10 @@ checks the signature and every payload before accepting an update. It rejects
 traversal, duplicate paths, unsafe symlinks, unsupported archive entries, and
 protected mutable paths, including `/etc/ld.so.cache`, `/var/lib`, `/root`, and
 local timezone and resolver links.
+
+The optional signed `base_sequence` manifest field binds a delta to an exact
+installed system build. Packs without that field remain applicable for
+backward compatibility.
 
 Repeat `--delete PATH` to remove retired files. Existing files are backed up;
 edited configuration files are retained when a deletion is applied. Repeat

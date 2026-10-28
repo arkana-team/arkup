@@ -15,6 +15,8 @@ pub struct UpdateManifest {
     pub name: String,
     pub version: String,
     pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sequence: Option<u64>,
     pub architecture: String,
     pub description: String,
     pub key_id: String,
@@ -54,6 +56,14 @@ impl UpdateManifest {
         );
         ensure!(valid_name(&self.name), "invalid update pack name");
         ensure!(valid_version(&self.version), "invalid update pack version");
+        if let Some(base_sequence) = self.base_sequence {
+            ensure!(
+                base_sequence < self.sequence,
+                "update base sequence {} must be older than target sequence {}",
+                base_sequence,
+                self.sequence
+            );
+        }
         ensure!(
             valid_atom(&self.architecture),
             "invalid update pack architecture"
@@ -343,12 +353,39 @@ mod tests {
     }
 
     #[test]
+    fn base_sequence_must_precede_target_sequence() {
+        let mut manifest = UpdateManifest {
+            format_version: FORMAT_VERSION,
+            name: "arkanaos-system".into(),
+            version: "arkanaOS 1.0 (alpha 1) build 12".into(),
+            sequence: 12,
+            base_sequence: Some(12),
+            architecture: "x86_64".into(),
+            description: "weekly system update".into(),
+            key_id: "0011223344556677001122334455667700112233445566770011223344556677".into(),
+            entries: vec![UpdateEntry {
+                path: "usr/bin/tool".into(),
+                kind: EntryKind::Delete,
+                mode: 0,
+                size: None,
+                sha256: None,
+                target: None,
+                config: false,
+            }],
+        };
+        assert!(manifest.validate().is_err());
+        manifest.base_sequence = Some(11);
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
     fn manifest_requires_sorted_unique_paths() {
         let mut manifest = UpdateManifest {
             format_version: FORMAT_VERSION,
             name: "system-update".into(),
             version: "1.0.1".into(),
             sequence: 1,
+            base_sequence: None,
             architecture: "x86_64".into(),
             description: "system update".into(),
             key_id: "0011223344556677001122334455667700112233445566770011223344556677".into(),
@@ -394,6 +431,7 @@ mod tests {
             name: "system-update".into(),
             version: "arkanaOS 1.0 (alpha 1) build 891".into(),
             sequence: 891,
+            base_sequence: None,
             architecture: "x86_64".into(),
             description: "system update".into(),
             key_id: "0011223344556677001122334455667700112233445566770011223344556677".into(),
@@ -430,6 +468,7 @@ mod tests {
             name: "system-update".into(),
             version: "1.0.1".into(),
             sequence: 1,
+            base_sequence: None,
             architecture: "x86_64".into(),
             description: "system update".into(),
             key_id: "0011223344556677001122334455667700112233445566770011223344556677".into(),

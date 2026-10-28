@@ -44,6 +44,9 @@ enum Command {
         version: String,
         #[arg(long)]
         sequence: u64,
+        /// Require the installed system build to match this update's base.
+        #[arg(long)]
+        base_sequence: Option<u64>,
         #[arg(long, default_value = "any")]
         arch: String,
         #[arg(long)]
@@ -110,6 +113,7 @@ fn run() -> Result<()> {
             name,
             version,
             sequence,
+            base_sequence,
             arch,
             description,
             signing_key,
@@ -122,6 +126,7 @@ fn run() -> Result<()> {
                 name,
                 version,
                 sequence,
+                base_sequence,
                 architecture: arch,
                 description,
                 signing_key,
