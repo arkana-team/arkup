@@ -6,12 +6,13 @@ use std::fs::{self, File};
 use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // Keep the checked parent open for staging, installation, deletion and rollback.
 // Reopening its pathname would allow a directory symlink swap to redirect them.
 pub(super) struct Destination {
-    pub parent: File,
+    pub parent: Arc<File>,
     pub name: OsString,
     pub path: PathBuf,
 }
