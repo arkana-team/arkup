@@ -57,6 +57,7 @@ struct AppliedChange {
 #[derive(Default)]
 struct DirectoryCache {
     directories: HashMap<(u64, u64), Arc<File>>,
+    file_descriptor_limit: Option<FileDescriptorLimit>,
 }
 
 struct DirectoryContext<'a> {
@@ -65,11 +66,26 @@ struct DirectoryContext<'a> {
 }
 
 impl DirectoryCache {
+    fn with_file_descriptor_limit(file_descriptor_limit: FileDescriptorLimit) -> Self {
+        Self {
+            directories: HashMap::new(),
+            file_descriptor_limit: Some(file_descriptor_limit),
+        }
+    }
+
     fn share(&mut self, directory: File) -> Result<Arc<File>> {
         let metadata = directory.metadata()?;
         let identity = (metadata.dev(), metadata.ino());
         if let Some(existing) = self.directories.get(&identity) {
             return Ok(Arc::clone(existing));
+        }
+        if let Some(file_descriptor_limit) = &mut self.file_descriptor_limit {
+            let required = self
+                .directories
+                .len()
+                .saturating_add(1)
+                .saturating_add(FILE_DESCRIPTOR_RESERVE);
+            file_descriptor_limit.ensure(required)?;
         }
         let directory = Arc::new(directory);
         self.directories.insert(identity, Arc::clone(&directory));
@@ -92,6 +108,42 @@ impl Drop for FileDescriptorLimit {
     }
 }
 
+impl FileDescriptorLimit {
+    fn ensure(&mut self, required: usize) -> Result<()> {
+        ensure!(
+            required <= MAX_TRANSACTION_DIRECTORY_FDS,
+            "update requires {required} directory file descriptors, above the supported limit of {MAX_TRANSACTION_DIRECTORY_FDS}"
+        );
+        let required = libc::rlim_t::try_from(required)
+            .context("update file descriptor requirement is outside the supported range")?;
+        let mut limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        ensure!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } == 0,
+            "cannot read the process file descriptor limit: {}",
+            io::Error::last_os_error()
+        );
+        if limits.rlim_cur >= required {
+            return Ok(());
+        }
+        ensure!(
+            limits.rlim_max >= required,
+            "update requires at least {required} open file descriptors for safe rollback, but the process hard limit is {}; raise it and retry",
+            limits.rlim_max
+        );
+        let original = limits;
+        limits.rlim_cur = required;
+        ensure!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } == 0,
+            "cannot raise the process soft file descriptor limit to {required}: {}",
+            io::Error::last_os_error()
+        );
+        if self.original.is_none() {
+            self.original = Some(original);
+        }
+        Ok(())
+    }
+}
+
 fn required_directory_descriptors(manifest: &UpdateManifest) -> usize {
     let mut directories = HashSet::new();
     for entry in &manifest.entries {
@@ -107,36 +159,9 @@ fn required_directory_descriptors(manifest: &UpdateManifest) -> usize {
 
 fn reserve_file_descriptors(manifest: &UpdateManifest) -> Result<FileDescriptorLimit> {
     let required = required_directory_descriptors(manifest);
-    ensure!(
-        required <= MAX_TRANSACTION_DIRECTORY_FDS,
-        "update requires {required} directory file descriptors, above the supported limit of {MAX_TRANSACTION_DIRECTORY_FDS}"
-    );
-    let required = libc::rlim_t::try_from(required)
-        .context("update file descriptor requirement is outside the supported range")?;
-    let mut limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
-    ensure!(
-        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } == 0,
-        "cannot read the process file descriptor limit: {}",
-        io::Error::last_os_error()
-    );
-    if limits.rlim_cur >= required {
-        return Ok(FileDescriptorLimit { original: None });
-    }
-    ensure!(
-        limits.rlim_max >= required,
-        "update requires at least {required} open file descriptors for safe rollback, but the process hard limit is {}; raise it and retry",
-        limits.rlim_max
-    );
-    let original = limits;
-    limits.rlim_cur = required;
-    ensure!(
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } == 0,
-        "cannot raise the process soft file descriptor limit to {required}: {}",
-        io::Error::last_os_error()
-    );
-    Ok(FileDescriptorLimit {
-        original: Some(original),
-    })
+    let mut file_descriptor_limit = FileDescriptorLimit { original: None };
+    file_descriptor_limit.ensure(required)?;
+    Ok(file_descriptor_limit)
 }
 
 struct Snapshot {
@@ -175,7 +200,7 @@ pub fn apply(options: &ApplyOptions) -> Result<UpdateManifest> {
         architecture
     );
 
-    let _file_descriptor_limit = reserve_file_descriptors(&manifest)?;
+    let file_descriptor_limit = reserve_file_descriptors(&manifest)?;
 
     ensure_state_directory(&root, "var/lib/arkup")?;
     ensure_state_directory(&root, "var/lib/arkup/installed")?;
@@ -212,7 +237,7 @@ pub fn apply(options: &ApplyOptions) -> Result<UpdateManifest> {
 
     let mut changes = Vec::new();
     let mut created_directories = Vec::new();
-    let mut directory_cache = DirectoryCache::default();
+    let mut directory_cache = DirectoryCache::with_file_descriptor_limit(file_descriptor_limit);
     let result = (|| {
         for_each_payload(&options.archive, &manifest, |entry, reader| {
             match entry.kind {
@@ -1243,6 +1268,92 @@ mod tests {
         assert_eq!(
             fs::read(root.join("usr/bin/tool-1099")).unwrap(),
             b"descriptor-bounded update"
+        );
+        let mut restored_limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut restored_limits) },
+            0
+        );
+        assert_eq!(restored_limits.rlim_cur, 64);
+    }
+
+    #[test]
+    fn apply_expands_descriptor_budget_for_symlink_target_directories() {
+        const CHILD_MARKER: &str = "ARKUP_SYMLINK_FD_APPLY_CHILD";
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(OsStr::new("1")) {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "install::tests::apply_expands_descriptor_budget_for_symlink_target_directories",
+                ])
+                .env(CHILD_MARKER, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "symlink low-descriptor child test failed");
+            return;
+        }
+
+        let mut limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+            0
+        );
+        assert!(limits.rlim_max >= 64);
+        limits.rlim_cur = 64;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let root = temp.path().join("root");
+        let key_dir = temp.path().join("keys");
+        let package = temp.path().join("symlink-target.aup");
+        fs::create_dir_all(source.join("alias")).unwrap();
+        fs::write(source.join("alias/tool"), b"symlink target update").unwrap();
+
+        let target = root.join("real");
+        fs::create_dir_all(&target).unwrap();
+        let mut deep_target = target;
+        for index in 0..96 {
+            deep_target.push(format!("dir-{index:03}"));
+            fs::create_dir(&deep_target).unwrap();
+        }
+        symlink(&deep_target, root.join("alias")).unwrap();
+
+        let (key_id, signing_key, public_key) = generate_keypair(&key_dir).unwrap();
+        create_pack(&PackOptions {
+            source,
+            deletions: Vec::new(),
+            system_files: Vec::new(),
+            name: "arkanaos-system".into(),
+            version: "1.0.1".into(),
+            sequence: 2,
+            base_sequence: None,
+            system_update: false,
+            architecture: "any".into(),
+            description: "exercise symlink target descriptor bounds".into(),
+            signing_key,
+            output: package.clone(),
+        })
+        .unwrap();
+        fs::create_dir_all(root.join("etc/arkup/trustedkeys.d")).unwrap();
+        fs::copy(
+            public_key,
+            root.join(format!("etc/arkup/trustedkeys.d/{key_id}.pub")),
+        )
+        .unwrap();
+
+        apply(&ApplyOptions {
+            archive: package,
+            root: root.clone(),
+            supplied_key: None,
+            architecture: Some("x86_64".into()),
+            allow_downgrade: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read(deep_target.join("tool")).unwrap(),
+            b"symlink target update"
         );
         let mut restored_limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
         assert_eq!(
