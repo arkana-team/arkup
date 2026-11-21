@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/arkana-team/arkup/security/advisories/new
+    about: |
+      Signature bypasses, path traversal, protected-path writes, and unbounded
+      resource use while parsing a pack are security bugs. Please report them
+      privately following SECURITY.md rather than opening a public issue.

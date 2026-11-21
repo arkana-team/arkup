@@ -68,6 +68,28 @@ Trust import requires directory ancestry owned by root or the invoking user,
 without group or other write access. Sticky directories above the target root
 (such as `/tmp`) are allowed.
 
+## Command reference
+
+| Command | Purpose | Root required |
+| --- | --- | --- |
+| `arkup keygen` | Create a release signing keypair | No |
+| `arkup trust KEY.pub` | Add a public key to a trust store | Only with `--root /` |
+| `arkup pack` | Build a signed `.aup` from a staged tree | No |
+| `arkup verify PACK` | Check the signature, manifest, and every payload hash | No |
+| `arkup list PACK` | Print the entries of a verified pack | No |
+| `arkup apply PACK` | Install a verified pack, backing up replaced files | Only with `--root /` |
+
+`trust`, `verify`, `list`, and `apply` accept `--root DIR` to select the target
+system; the default is `/`. `verify`, `list`, and `apply` also accept
+`--key KEY.pub` to check a pack against one public key instead of the trust
+store. `pack` signs with `--signing-key KEY.key` instead.
+
+`--key` skips the trust store entirely, including the ownership and permission
+checks that protect `etc/arkup/trustedkeys.d`. Use it to inspect a pack on a
+build machine. Do not use it to install an update on a production root: it
+reduces "signed by a key this system trusts" to "signed by a key the caller
+handed to arkup".
+
 ## Pack format and safety
 
 Each pack contains `arkup.json`, `arkup.sig`, and `payload/` files. The Ed25519
@@ -95,6 +117,54 @@ the new default as `.arkup-new`, and restores changed files if any step fails.
 Update packs cannot run install scripts or arbitrary hooks. Keep release
 signing keys offline and distribute trusted public keys through a trusted
 channel.
+
+## Operational behavior
+
+Apply is transactional with respect to errors. Each replaced file is copied
+into `/var/lib/arkup/backups/<name>-<sequence>-<timestamp>-<pid>/` before it
+changes, and a failure in any later step restores every snapshot in reverse
+order, including file ownership and setuid, setgid, and sticky bits. The
+installed record is written last, so a rolled-back update leaves the previous
+sequence in place and the pack can be applied again.
+
+A process that is killed, or a machine that loses power mid-apply, is not
+rolled back: the snapshot list lives in memory. The backup directory still
+holds the previous copies, and `var/lib/arkup/installed/<name>.json` shows
+whether the record advanced. Recovery is manual.
+
+Backup directories are never removed, and every apply creates one even when it
+replaces nothing. On a long-lived system `/var/lib/arkup/backups/` grows
+without bound, holding a full copy of each replaced or deleted file. Prune it
+with your own retention policy; arkup has no pruning command.
+
+File modes come verbatim from the staged tree, so setuid, setgid, and sticky
+bits are reproduced on the target. `arkup pack` therefore needs the same care
+as a release build directory. New files are owned by the user running
+`arkup apply`.
+
+## Known limitations
+
+- **A stale `.arkup-new` sidecar blocks all later updates to that file.** When
+  a locally edited configuration file is updated, arkup writes the new default
+  to `<path>.arkup-new` and keeps the local file. If that sidecar is still
+  present when a later update touches the same file, arkup refuses to
+  overwrite it and the whole update rolls back. Resolve the pending sidecar
+  before applying further updates.
+- **Trusted keys cannot be revoked.** There is no `arkup distrust`. Removing a
+  key means deleting `etc/arkup/trustedkeys.d/<key-id>.pub` by hand.
+- **An update is bound to the trust store, not to a specific key.** The
+  installed record stores the signing key id but arkup does not compare it, so
+  a pack signed by any trusted key can replace state installed by another
+  trusted key. Trust only keys whose holders you would let update the system.
+- **The packer drops protected paths silently.** Anything under a protected
+  prefix in the staging tree is omitted from the pack with no warning, so a
+  release build that stages `/var/lib` or `usr/local` content produces a pack
+  that is quietly missing those files. Check `arkup list` against the staging
+  tree before publishing.
+- **Updates are only as trustworthy as the signing key.** A signed pack can
+  replace any non-protected file, install setuid binaries, and delete files.
+  arkup's guarantees are about integrity and containment, not about limiting
+  what a release may contain.
 
 ## Scope
 

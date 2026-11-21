@@ -1,0 +1,65 @@
+name: Bug report
+description: Report an arkup defect. For security bugs, use the private reporting flow in SECURITY.md instead.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If this is a signature bypass, path traversal, protected-path write, or
+        unbounded resource use while parsing a pack, please **do not** file it
+        here. Follow [SECURITY.md](/blob/main/SECURITY.md) instead.
+  - type: input
+    id: version
+    attributes:
+      label: arkup version
+      description: Output of `arkup --version`, plus the commit if you built from source.
+      placeholder: arkup 0.1.0 (commit 01f6af6)
+    validations:
+      required: true
+  - type: dropdown
+    id: command
+    attributes:
+      label: Which command is affected?
+      multiple: true
+      options:
+        - keygen
+        - trust
+        - pack
+        - verify
+        - list
+        - apply
+        - other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead?
+      description: Include the exact command line and the full stderr output.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: |
+        The smallest `keygen` / `trust` / `pack` / `apply` sequence that shows
+        the problem, using `--root /path/to/tempdir` so no real system is
+        touched. If a specific `.aup` is required, describe how it was built
+        rather than attaching it.
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Distribution, kernel, filesystem of the target root, and whether the target root is a real `/` or a test directory.
+    validations:
+      required: true
