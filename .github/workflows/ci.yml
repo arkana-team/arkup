@@ -58,7 +58,13 @@ jobs:
       - name: Build tests as the runner user
         run: cargo test --locked --no-run
       - name: Run the ignored root-only test
-        run: sudo -E env "PATH=$PATH" cargo test --locked -- --ignored --exact --nocapture install::tests::failed_update_restores_unprivileged_file_ownership
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_TOOLCHAIN=stable" \
+            cargo test --locked -- --ignored --exact --nocapture install::tests::failed_update_restores_unprivileged_file_ownership
 
   # A broken intra-doc link or a doctest that no longer compiles should fail
   # here rather than on docs.rs.
