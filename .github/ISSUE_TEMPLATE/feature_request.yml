@@ -1,0 +1,48 @@
+name: Feature request
+description: Propose a new arkup capability or a change to operator-visible behavior.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the operational situation, not the flag you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What the command should do, including what it should refuse to do.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - CLI surface
+        - Pack format
+        - Signing / trust store
+        - Apply / rollback
+        - Packaging / distribution
+        - Documentation
+        - CI / developer experience
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Does this belong in arkup or arkpkg?
+      description: |
+        arkup handles core system and feature updates; arkpkg handles optional
+        applications. If the request is about optional applications, it belongs
+        in arkpkg.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include the workaround you use today, if any.

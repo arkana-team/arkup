@@ -2,23 +2,79 @@ name: ci
 
 on:
   push:
+    # Restrict to the default branch: `pull_request` already covers every PR
+    # head, so an unfiltered `push` runs the whole matrix twice per commit.
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Memory-limited build host guidance from the README, applied everywhere.
+  CARGO_BUILD_JOBS: 1
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo test --locked
-        env:
-          CARGO_BUILD_JOBS: 1
       - run: cargo clippy --locked --all-targets -- -D warnings
+
+  # Cargo.toml declares rust-version = "1.85" (edition 2024 requires it), but
+  # nothing enforced it, so a dependency bump could silently raise the real
+  # floor. Build on the declared MSRV to keep that promise honest.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: rustc --version
+      - run: cargo build --locked --all-targets
+
+  # `failed_update_restores_unprivileged_file_ownership` is #[ignore]d because it
+  # needs root to chown a file to another uid/gid. Without this job it never
+  # runs anywhere, so rollback ownership restoration stays untested.
+  rollback-ownership-as-root:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build tests as the runner user
+        run: cargo test --locked --no-run
+      - name: Run the ignored root-only test
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_TOOLCHAIN=stable" \
+            cargo test --locked -- --ignored --exact --nocapture install::tests::failed_update_restores_unprivileged_file_ownership
+
+  # A broken intra-doc link or a doctest that no longer compiles should fail
+  # here rather than on docs.rs.
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --locked --no-deps
         env:
-          CARGO_BUILD_JOBS: 1
+          RUSTDOCFLAGS: -D warnings
