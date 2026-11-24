@@ -157,11 +157,25 @@ fn required_directory_descriptors(manifest: &UpdateManifest) -> usize {
     directories.len().saturating_add(FILE_DESCRIPTOR_RESERVE)
 }
 
-fn reserve_file_descriptors(manifest: &UpdateManifest) -> Result<FileDescriptorLimit> {
+fn reserve_file_descriptors(root: &Path, manifest: &UpdateManifest) -> Result<FileDescriptorLimit> {
     let required = required_directory_descriptors(manifest);
-    let mut file_descriptor_limit = FileDescriptorLimit { original: None };
-    file_descriptor_limit.ensure(required)?;
-    Ok(file_descriptor_limit)
+    let file_descriptor_limit = FileDescriptorLimit { original: None };
+    let mut directory_cache = DirectoryCache::with_file_descriptor_limit(file_descriptor_limit);
+    directory_cache
+        .file_descriptor_limit
+        .as_mut()
+        .expect("preflight directory cache tracks the descriptor limit")
+        .ensure(required)?;
+
+    for entry in &manifest.entries {
+        let _ = resolve_existing_destination_with_cache(root, &entry.path, &mut directory_cache)
+            .with_context(|| format!("cannot preflight update path {}", entry.path))?;
+    }
+
+    directory_cache
+        .file_descriptor_limit
+        .take()
+        .context("preflight lost the update file descriptor limit")
 }
 
 struct Snapshot {
@@ -200,7 +214,7 @@ pub fn apply(options: &ApplyOptions) -> Result<UpdateManifest> {
         architecture
     );
 
-    let file_descriptor_limit = reserve_file_descriptors(&manifest)?;
+    let file_descriptor_limit = reserve_file_descriptors(&root, &manifest)?;
 
     ensure_state_directory(&root, "var/lib/arkup")?;
     ensure_state_directory(&root, "var/lib/arkup/installed")?;
@@ -1361,6 +1375,89 @@ mod tests {
             0
         );
         assert_eq!(restored_limits.rlim_cur, 64);
+    }
+
+    #[test]
+    fn apply_preflights_symlink_target_descriptor_budget_before_mutation() {
+        const CHILD_MARKER: &str = "ARKUP_SYMLINK_FD_PREFLIGHT_CHILD";
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(OsStr::new("1")) {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "install::tests::apply_preflights_symlink_target_descriptor_budget_before_mutation",
+                ])
+                .env(CHILD_MARKER, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "symlink preflight child test failed");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let root = temp.path().join("root");
+        let key_dir = temp.path().join("keys");
+        let package = temp.path().join("symlink-target-over-limit.aup");
+        fs::create_dir_all(source.join("alias")).unwrap();
+        fs::write(source.join("a-first"), b"new content").unwrap();
+        fs::write(source.join("alias/tool"), b"symlink target update").unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a-first"), b"original content").unwrap();
+
+        let mut deep_target = root.join("real");
+        fs::create_dir_all(&deep_target).unwrap();
+        for index in 0..96 {
+            deep_target.push(format!("dir-{index:03}"));
+            fs::create_dir(&deep_target).unwrap();
+        }
+        symlink(&deep_target, root.join("alias")).unwrap();
+
+        let (key_id, signing_key, public_key) = generate_keypair(&key_dir).unwrap();
+        create_pack(&PackOptions {
+            source,
+            deletions: Vec::new(),
+            system_files: Vec::new(),
+            name: "arkanaos-system".into(),
+            version: "1.0.1".into(),
+            sequence: 2,
+            base_sequence: None,
+            system_update: false,
+            architecture: "any".into(),
+            description: "reject an unbudgeted symlink target before mutation".into(),
+            signing_key,
+            output: package.clone(),
+        })
+        .unwrap();
+        fs::create_dir_all(root.join("etc/arkup/trustedkeys.d")).unwrap();
+        fs::copy(
+            public_key,
+            root.join(format!("etc/arkup/trustedkeys.d/{key_id}.pub")),
+        )
+        .unwrap();
+
+        let mut limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+            0
+        );
+        assert!(limits.rlim_max >= 128);
+        limits.rlim_cur = 128;
+        limits.rlim_max = 128;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+
+        let error = apply(&ApplyOptions {
+            archive: package,
+            root: root.clone(),
+            supplied_key: None,
+            architecture: Some("x86_64".into()),
+            allow_downgrade: false,
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("process hard limit is 128"));
+        assert_eq!(fs::read(root.join("a-first")).unwrap(), b"original content");
+        assert!(!root.join("var/lib/arkup").exists());
+        assert!(!deep_target.join("tool").exists());
     }
 
     #[test]
