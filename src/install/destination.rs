@@ -2,16 +2,17 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{self as at, AtFlags, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // Keep the checked parent open for staging, installation, deletion and rollback.
 // Reopening its pathname would allow a directory symlink swap to redirect them.
 pub(super) struct Destination {
-    pub parent: File,
+    pub parent: Arc<File>,
     pub name: OsString,
     pub path: PathBuf,
 }
@@ -152,10 +153,6 @@ pub(super) fn open_directory(parent: &File, name: &Path) -> Result<File> {
     .into())
 }
 
-pub(super) fn create_directory(parent: &File, name: &str) -> Result<File> {
-    at::mkdirat(parent, name, Mode::from_raw_mode(0o755))?;
-    let directory = open_directory(parent, Path::new(name))?;
-    use std::os::unix::fs::PermissionsExt;
-    directory.set_permissions(fs::Permissions::from_mode(0o755))?;
-    Ok(directory)
+pub(super) fn create_directory(parent: &File, name: &str) -> Result<()> {
+    Ok(at::mkdirat(parent, name, Mode::from_raw_mode(0o755))?)
 }

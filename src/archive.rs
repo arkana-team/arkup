@@ -56,6 +56,7 @@ pub struct PackOptions {
 #[derive(Debug, Clone)]
 pub struct VerifiedPackage {
     pub manifest: UpdateManifest,
+    pub payload_order: Vec<usize>,
 }
 
 pub fn create_pack(options: &PackOptions) -> Result<UpdateManifest> {
@@ -348,12 +349,14 @@ pub fn verify_archive_with_key(
     );
     key::verify(verifying_key, &manifest_bytes, &signature)?;
 
-    let manifest_entries: BTreeMap<&str, &UpdateEntry> = manifest
+    let manifest_entries: BTreeMap<&str, (usize, &UpdateEntry)> = manifest
         .entries
         .iter()
-        .map(|entry| (entry.path.as_str(), entry))
+        .enumerate()
+        .map(|(index, entry)| (entry.path.as_str(), (index, entry)))
         .collect();
     let mut seen = HashSet::new();
+    let mut payload_order = Vec::new();
     let mut total_bytes = 0_u64;
     for entry in entries {
         let mut entry = entry?;
@@ -370,7 +373,7 @@ pub fn verify_archive_with_key(
             "duplicate update archive entry '{}'",
             relative
         );
-        let expected = manifest_entries
+        let &(index, expected) = manifest_entries
             .get(relative)
             .ok_or_else(|| anyhow::anyhow!("unlisted update archive entry '{}'", relative))?;
         let mode = entry.header().mode()? & 0o7777;
@@ -419,6 +422,7 @@ pub fn verify_archive_with_key(
             }
             EntryKind::Delete => bail!("delete entry '{}' must not have a payload", relative),
         }
+        payload_order.push(index);
     }
     ensure!(
         seen.len()
@@ -430,7 +434,17 @@ pub fn verify_archive_with_key(
         "update archive is missing payload files"
     );
 
-    Ok(VerifiedPackage { manifest })
+    payload_order.extend(
+        manifest
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| (entry.kind == EntryKind::Delete).then_some(index)),
+    );
+    Ok(VerifiedPackage {
+        manifest,
+        payload_order,
+    })
 }
 
 pub fn for_each_payload(
@@ -1076,6 +1090,39 @@ mod tests {
         let verified = verify_archive_with_key(&output, &signing.verifying_key()).unwrap();
         assert_eq!(verified.manifest.name, "desktop-feature");
         assert_eq!(verified.manifest.entries.len(), 3);
+    }
+
+    #[test]
+    fn verification_records_tar_order_followed_by_deletions() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let package = temp.path().join("original.aup");
+        let reordered = temp.path().join("reordered.aup");
+        let signing_path = temp.path().join("signing.key");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("a-file"), b"one").unwrap();
+        fs::write(source.join("z-file"), b"two").unwrap();
+        let signing = signing_key();
+        write_key(&signing_path, &signing);
+        let mut options = test_options(&source, &package, &signing_path);
+        options.deletions.push("b-obsolete".into());
+        let manifest = create_pack(&options).unwrap();
+        rewrite_archive(&package, &reordered, |_, _, entries| entries.reverse());
+        let verified = verify_archive_with_key(&reordered, &signing.verifying_key()).unwrap();
+
+        let mut applied_order = Vec::new();
+        for_each_payload(&reordered, &manifest, |entry, _| {
+            applied_order.push(entry.path.clone());
+            Ok(())
+        })
+        .unwrap();
+        let planned_order: Vec<_> = verified
+            .payload_order
+            .iter()
+            .map(|&index| &verified.manifest.entries[index].path)
+            .collect();
+        assert_eq!(planned_order, ["z-file", "a-file", "b-obsolete"]);
+        assert_eq!(planned_order, applied_order.iter().collect::<Vec<_>>());
     }
 
     #[test]

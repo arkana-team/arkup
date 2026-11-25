@@ -1,4 +1,5 @@
 mod destination;
+mod preflight;
 
 use crate::archive::{for_each_payload, verify_archive};
 use crate::key;
@@ -10,9 +11,11 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use destination::{Destination, create_directory, open_directory};
+use preflight::DescriptorPlan;
 use rustix::fs::{AtFlags, FileType, Stat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -21,9 +24,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RECORD_FORMAT: u32 = 1;
+// Leave room for the archive, lock, and transient staging, record, backup, and
+// rollback handles in addition to the retained directory handles.
+const FILE_DESCRIPTOR_RESERVE: usize = 64;
+const MAX_TRANSACTION_DIRECTORY_FDS: usize = 65_536;
+const STATE_DIRECTORY: &str = "var/lib/arkup";
+const INSTALLED_DIRECTORY: &str = "var/lib/arkup/installed";
+const BACKUP_DIRECTORY: &str = "var/lib/arkup/backups";
 
 #[derive(Debug, Clone)]
 pub struct ApplyOptions {
@@ -34,7 +45,7 @@ pub struct ApplyOptions {
     pub allow_downgrade: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstalledRecord {
     format_version: u32,
@@ -48,6 +59,155 @@ struct InstalledRecord {
 struct AppliedChange {
     destination: Destination,
     backup: Option<Snapshot>,
+}
+
+#[derive(Default)]
+struct DirectoryCache {
+    directories: HashMap<(u64, u64), Arc<File>>,
+    file_descriptor_limit: Option<FileDescriptorLimit>,
+}
+
+struct DirectoryContext<'a> {
+    created_directories: &'a mut Vec<Destination>,
+    cache: &'a mut DirectoryCache,
+}
+
+impl DirectoryCache {
+    fn with_file_descriptor_limit(file_descriptor_limit: FileDescriptorLimit) -> Self {
+        Self {
+            directories: HashMap::new(),
+            file_descriptor_limit: Some(file_descriptor_limit),
+        }
+    }
+
+    fn share(&mut self, directory: File) -> Result<Arc<File>> {
+        let metadata = directory.metadata()?;
+        let identity = (metadata.dev(), metadata.ino());
+        if let Some(existing) = self.directories.get(&identity) {
+            return Ok(Arc::clone(existing));
+        }
+        if let Some(file_descriptor_limit) = &mut self.file_descriptor_limit {
+            let required = self
+                .directories
+                .len()
+                .saturating_add(1)
+                .saturating_add(FILE_DESCRIPTOR_RESERVE);
+            file_descriptor_limit.ensure(required)?;
+        }
+        let directory = Arc::new(directory);
+        self.directories.insert(identity, Arc::clone(&directory));
+        Ok(directory)
+    }
+}
+
+struct FileDescriptorLimit {
+    original: Option<libc::rlimit>,
+    already_open: usize,
+}
+
+impl Drop for FileDescriptorLimit {
+    fn drop(&mut self) {
+        if let Some(original) = self.original {
+            // Restoring a previously held soft limit only lowers this process's limit.
+            unsafe {
+                libc::setrlimit(libc::RLIMIT_NOFILE, &original);
+            }
+        }
+    }
+}
+
+impl FileDescriptorLimit {
+    fn ensure(&mut self, required: usize) -> Result<()> {
+        ensure!(
+            required <= MAX_TRANSACTION_DIRECTORY_FDS,
+            "update requires {required} directory file descriptors, above the supported limit of {MAX_TRANSACTION_DIRECTORY_FDS}"
+        );
+        let required = required
+            .checked_add(self.already_open)
+            .context("update file descriptor requirement overflow")?;
+        let required = libc::rlim_t::try_from(required)
+            .context("update file descriptor requirement is outside the supported range")?;
+        let mut limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        ensure!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } == 0,
+            "cannot read the process file descriptor limit: {}",
+            io::Error::last_os_error()
+        );
+        if limits.rlim_cur >= required {
+            return Ok(());
+        }
+        ensure!(
+            limits.rlim_max >= required,
+            "update requires at least {required} open file descriptors for safe rollback, but the process hard limit is {}; raise it and retry",
+            limits.rlim_max
+        );
+        let original = limits;
+        limits.rlim_cur = required;
+        ensure!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } == 0,
+            "cannot raise the process soft file descriptor limit to {required}: {}",
+            io::Error::last_os_error()
+        );
+        if self.original.is_none() {
+            self.original = Some(original);
+        }
+        Ok(())
+    }
+}
+
+fn reserve_file_descriptors<'a>(
+    root: &Path,
+    entries: impl Iterator<Item = &'a UpdateEntry>,
+    record_relative: &str,
+    previous: Option<&InstalledRecord>,
+) -> Result<FileDescriptorLimit> {
+    let mut plan = DescriptorPlan::new(root);
+    // State is created before the payload. Include its directories in the same
+    // budget as the record parent and payload directories, even when absent.
+    plan.resolve(record_relative, true, None)
+        .context("cannot preflight installed record path")?;
+    plan.resolve(
+        &format!("{BACKUP_DIRECTORY}/.arkup-directory-marker"),
+        true,
+        None,
+    )
+    .context("cannot preflight backup directory path")?;
+    let protected = protected_update_paths(root)?;
+    for entry in entries {
+        let Some(path) = plan
+            .resolve(
+                &entry.path,
+                entry.kind != EntryKind::Delete,
+                Some(&protected),
+            )
+            .with_context(|| format!("cannot preflight update path {}", entry.path))?
+        else {
+            continue;
+        };
+        plan.project_entry(entry, path, previous)?;
+    }
+    // Resolve again in the projected tree, just as write_record does after
+    // applying the payload.
+    plan.resolve(record_relative, true, None)
+        .context("cannot preflight final installed record path")?;
+
+    // read_dir itself holds a descriptor, which is intentionally included in
+    // the count. If procfs is unavailable or enumeration fails, fail closed.
+    let already_open = fs::read_dir("/proc/self/fd")
+        .context("cannot count open file descriptors for update preflight")?
+        .try_fold(0_usize, |count, entry| {
+            entry?;
+            count
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("file descriptor count overflow"))
+        })
+        .context("cannot count open file descriptors for update preflight")?;
+    let mut limit = FileDescriptorLimit {
+        original: None,
+        already_open,
+    };
+    limit.ensure(plan.required())?;
+    Ok(limit)
 }
 
 struct Snapshot {
@@ -86,15 +246,30 @@ pub fn apply(options: &ApplyOptions) -> Result<UpdateManifest> {
         architecture
     );
 
-    ensure_state_directory(&root, "var/lib/arkup")?;
-    ensure_state_directory(&root, "var/lib/arkup/installed")?;
-    ensure_state_directory(&root, "var/lib/arkup/backups")?;
+    let record_relative = format!("{INSTALLED_DIRECTORY}/{}.json", manifest.name);
+    let record_path = root.join(&record_relative);
+    let preflight_record = read_record(&record_path, &manifest.name)?;
+    let mut payload_order = verified
+        .payload_order
+        .iter()
+        .map(|&index| &manifest.entries[index]);
+    let file_descriptor_limit = reserve_file_descriptors(
+        &root,
+        payload_order.clone(),
+        &record_relative,
+        preflight_record.as_ref(),
+    )?;
+
+    ensure_state_directory(&root, STATE_DIRECTORY)?;
+    ensure_state_directory(&root, INSTALLED_DIRECTORY)?;
+    ensure_state_directory(&root, BACKUP_DIRECTORY)?;
     let _lock = acquire_lock(&root)?;
 
-    let record_path = root
-        .join("var/lib/arkup/installed")
-        .join(format!("{}.json", manifest.name));
     let previous = read_record(&record_path, &manifest.name)?;
+    ensure!(
+        previous == preflight_record,
+        "installed record changed during update preflight; retry"
+    );
     if let Some(base_sequence) = manifest.base_sequence {
         let installed_sequence = read_installed_build_sequence(&root)?;
         ensure!(
@@ -114,40 +289,55 @@ pub fn apply(options: &ApplyOptions) -> Result<UpdateManifest> {
     }
 
     let backup_id = unique_backup_id(&manifest);
-    let backup_root = root.join("var/lib/arkup/backups").join(&backup_id);
+    let backup_root = root.join(BACKUP_DIRECTORY).join(&backup_id);
     fs::create_dir(&backup_root)
         .with_context(|| format!("cannot create backup directory {}", backup_root.display()))?;
     fs::set_permissions(&backup_root, fs::Permissions::from_mode(0o700))?;
 
     let mut changes = Vec::new();
     let mut created_directories = Vec::new();
+    let mut directory_cache = DirectoryCache::with_file_descriptor_limit(file_descriptor_limit);
     let result = (|| {
         for_each_payload(&options.archive, &manifest, |entry, reader| {
+            ensure!(
+                payload_order
+                    .next()
+                    .is_some_and(|expected| expected.path == entry.path),
+                "update payload order changed after preflight"
+            );
             match entry.kind {
-                EntryKind::File => apply_file(
+                EntryKind::File => {
+                    let mut directory_context = DirectoryContext {
+                        created_directories: &mut created_directories,
+                        cache: &mut directory_cache,
+                    };
+                    apply_file_with_cache(
+                        &root,
+                        entry,
+                        reader,
+                        previous.as_ref(),
+                        &backup_root,
+                        &mut changes,
+                        &mut directory_context,
+                    )
+                }
+                EntryKind::Symlink => apply_symlink_with_cache(
+                    &root,
+                    entry,
+                    reader,
+                    &backup_root,
+                    &mut changes,
+                    &mut created_directories,
+                    &mut directory_cache,
+                ),
+                EntryKind::Delete => apply_delete_with_cache(
                     &root,
                     entry,
                     reader,
                     previous.as_ref(),
                     &backup_root,
                     &mut changes,
-                    &mut created_directories,
-                ),
-                EntryKind::Symlink => apply_symlink(
-                    &root,
-                    entry,
-                    reader,
-                    &backup_root,
-                    &mut changes,
-                    &mut created_directories,
-                ),
-                EntryKind::Delete => apply_delete(
-                    &root,
-                    entry,
-                    reader,
-                    previous.as_ref(),
-                    &backup_root,
-                    &mut changes,
+                    &mut directory_cache,
                 ),
             }
         })?;
@@ -162,11 +352,12 @@ pub fn apply(options: &ApplyOptions) -> Result<UpdateManifest> {
         };
         write_record(
             &root,
-            &record_path,
+            &record_relative,
             &record,
             &backup_root,
             &mut changes,
             &mut created_directories,
+            &mut directory_cache,
         )?;
         File::open(&backup_root)?.sync_all()?;
         Ok::<(), anyhow::Error>(())
@@ -315,6 +506,7 @@ fn trust_directory(root: &Path) -> Result<File> {
     Ok(directory)
 }
 
+#[cfg(test)]
 fn apply_file(
     root: &Path,
     entry: &UpdateEntry,
@@ -324,11 +516,48 @@ fn apply_file(
     changes: &mut Vec<AppliedChange>,
     created_directories: &mut Vec<Destination>,
 ) -> Result<()> {
-    let mut destination = resolve_destination(root, &entry.path, created_directories, false)?;
+    let mut directory_cache = DirectoryCache::default();
+    let mut directory_context = DirectoryContext {
+        created_directories,
+        cache: &mut directory_cache,
+    };
+    apply_file_with_cache(
+        root,
+        entry,
+        reader,
+        previous,
+        backup_root,
+        changes,
+        &mut directory_context,
+    )
+}
+
+fn apply_file_with_cache(
+    root: &Path,
+    entry: &UpdateEntry,
+    reader: &mut dyn Read,
+    previous: Option<&InstalledRecord>,
+    backup_root: &Path,
+    changes: &mut Vec<AppliedChange>,
+    directory_context: &mut DirectoryContext<'_>,
+) -> Result<()> {
+    let mut destination = resolve_destination_with_cache(
+        root,
+        &entry.path,
+        directory_context.created_directories,
+        false,
+        directory_context.cache,
+    )?;
     let metadata = destination.existing_metadata()?;
     if entry.config && is_modified_config(&destination, metadata.as_ref(), entry, previous)? {
         let sidecar = format!("{}.arkup-new", entry.path);
-        destination = resolve_destination(root, &sidecar, created_directories, false)?;
+        destination = resolve_destination_with_cache(
+            root,
+            &sidecar,
+            directory_context.created_directories,
+            false,
+            directory_context.cache,
+        )?;
         ensure!(
             destination.existing_metadata()?.is_none(),
             "refusing to overwrite existing configuration update {}",
@@ -359,6 +588,7 @@ fn apply_file(
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_symlink(
     root: &Path,
     entry: &UpdateEntry,
@@ -367,12 +597,39 @@ fn apply_symlink(
     changes: &mut Vec<AppliedChange>,
     created_directories: &mut Vec<Destination>,
 ) -> Result<()> {
+    let mut directory_cache = DirectoryCache::default();
+    apply_symlink_with_cache(
+        root,
+        entry,
+        reader,
+        backup_root,
+        changes,
+        created_directories,
+        &mut directory_cache,
+    )
+}
+
+fn apply_symlink_with_cache(
+    root: &Path,
+    entry: &UpdateEntry,
+    reader: &mut dyn Read,
+    backup_root: &Path,
+    changes: &mut Vec<AppliedChange>,
+    created_directories: &mut Vec<Destination>,
+    directory_cache: &mut DirectoryCache,
+) -> Result<()> {
     let mut remaining = [0_u8; 1];
     ensure!(
         reader.read(&mut remaining)? == 0,
         "symlink payload must be empty"
     );
-    let destination = resolve_destination(root, &entry.path, created_directories, false)?;
+    let destination = resolve_destination_with_cache(
+        root,
+        &entry.path,
+        created_directories,
+        false,
+        directory_cache,
+    )?;
     let target = entry
         .target
         .as_deref()
@@ -387,6 +644,7 @@ fn apply_symlink(
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_delete(
     root: &Path,
     entry: &UpdateEntry,
@@ -395,12 +653,35 @@ fn apply_delete(
     backup_root: &Path,
     changes: &mut Vec<AppliedChange>,
 ) -> Result<()> {
+    let mut directory_cache = DirectoryCache::default();
+    apply_delete_with_cache(
+        root,
+        entry,
+        reader,
+        previous,
+        backup_root,
+        changes,
+        &mut directory_cache,
+    )
+}
+
+fn apply_delete_with_cache(
+    root: &Path,
+    entry: &UpdateEntry,
+    reader: &mut dyn Read,
+    previous: Option<&InstalledRecord>,
+    backup_root: &Path,
+    changes: &mut Vec<AppliedChange>,
+    directory_cache: &mut DirectoryCache,
+) -> Result<()> {
     let mut remaining = [0_u8; 1];
     ensure!(
         reader.read(&mut remaining)? == 0,
         "delete entry must have no payload"
     );
-    let Some(destination) = resolve_existing_destination(root, &entry.path)? else {
+    let Some(destination) =
+        resolve_existing_destination_with_cache(root, &entry.path, directory_cache)?
+    else {
         return Ok(());
     };
     let Some(metadata) = destination.existing_metadata()? else {
@@ -515,18 +796,59 @@ fn check_destination(root: &Path, path: &Path, protected: Option<&[PathBuf]>) ->
     Ok(())
 }
 
+fn protected_update_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut protected = Vec::new();
+    for path in PROTECTED_PATHS {
+        protected.extend(resolve_protected_path(root, path)?);
+    }
+    Ok(protected)
+}
+
 fn resolve_destination(
     root: &Path,
     relative: &str,
     created_directories: &mut Vec<Destination>,
     allow_protected: bool,
 ) -> Result<Destination> {
-    resolve_path(root, relative, Some(created_directories), allow_protected)?
-        .ok_or_else(|| anyhow::anyhow!("missing update destination parent"))
+    let mut directory_cache = DirectoryCache::default();
+    resolve_destination_with_cache(
+        root,
+        relative,
+        created_directories,
+        allow_protected,
+        &mut directory_cache,
+    )
 }
 
+fn resolve_destination_with_cache(
+    root: &Path,
+    relative: &str,
+    created_directories: &mut Vec<Destination>,
+    allow_protected: bool,
+    directory_cache: &mut DirectoryCache,
+) -> Result<Destination> {
+    resolve_path(
+        root,
+        relative,
+        Some(created_directories),
+        allow_protected,
+        directory_cache,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("missing update destination parent"))
+}
+
+#[cfg(test)]
 fn resolve_existing_destination(root: &Path, relative: &str) -> Result<Option<Destination>> {
-    resolve_path(root, relative, None, false)
+    let mut directory_cache = DirectoryCache::default();
+    resolve_existing_destination_with_cache(root, relative, &mut directory_cache)
+}
+
+fn resolve_existing_destination_with_cache(
+    root: &Path,
+    relative: &str,
+    directory_cache: &mut DirectoryCache,
+) -> Result<Option<Destination>> {
+    resolve_path(root, relative, None, false, directory_cache)
 }
 
 fn resolve_path(
@@ -534,6 +856,7 @@ fn resolve_path(
     relative: &str,
     mut created_directories: Option<&mut Vec<Destination>>,
     allow_protected: bool,
+    directory_cache: &mut DirectoryCache,
 ) -> Result<Option<Destination>> {
     let components: Vec<_> = relative.split('/').collect();
     ensure!(!components.is_empty(), "empty update path");
@@ -542,24 +865,19 @@ fn resolve_path(
     let protected: Vec<_> = if allow_protected {
         Vec::new()
     } else {
-        PROTECTED_PATHS
-            .iter()
-            .map(|path| resolve_protected_path(root, path))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect()
+        protected_update_paths(root)?
     };
     let protected = (!allow_protected).then_some(protected.as_slice());
     let root_directory = File::options()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(root)?;
-    let mut parent = root_directory.try_clone()?;
+    let root_directory = directory_cache.share(root_directory)?;
+    let mut parent = Arc::clone(&root_directory);
     let mut current = root.to_path_buf();
     for component in &components[..components.len() - 1] {
         let candidate = Destination {
-            parent: parent.try_clone()?,
+            parent: Arc::clone(&parent),
             name: (*component).into(),
             path: current.join(component),
         };
@@ -580,14 +898,16 @@ fn resolve_path(
                 check_destination(root, &resolved, protected)?;
                 // Open every resolved component without following symlinks. A
                 // concurrent replacement after canonicalize must fail closed.
-                parent = root_directory.try_clone()?;
+                parent = Arc::clone(&root_directory);
                 for part in resolved.strip_prefix(root)?.components() {
-                    parent = open_directory(&parent, Path::new(part.as_os_str()))?;
+                    let directory = open_directory(&parent, Path::new(part.as_os_str()))?;
+                    parent = directory_cache.share(directory)?;
                 }
                 current = resolved;
             }
             Some(metadata) if FileType::from_raw_mode(metadata.st_mode).is_dir() => {
-                parent = open_directory(&parent, Path::new(component))?;
+                let directory = open_directory(&parent, Path::new(component))?;
+                parent = directory_cache.share(directory)?;
                 current = candidate.path;
             }
             Some(_) => bail!(
@@ -598,14 +918,17 @@ fn resolve_path(
                 let Some(created) = created_directories.as_mut() else {
                     return Ok(None);
                 };
-                parent = create_directory(&parent, component).with_context(|| {
+                current = candidate.path.clone();
+                create_directory(&parent, component).with_context(|| {
                     format!(
                         "cannot create update directory {}",
                         candidate.path.display()
                     )
                 })?;
-                current = candidate.path.clone();
                 created.push(candidate);
+                let directory = open_directory(&parent, Path::new(component))?;
+                directory.set_permissions(fs::Permissions::from_mode(0o755))?;
+                parent = directory_cache.share(directory)?;
             }
         }
     }
@@ -665,24 +988,21 @@ fn snapshot_existing(
 
 fn write_record(
     root: &Path,
-    record_path: &Path,
+    relative: &str,
     record: &InstalledRecord,
     backup_root: &Path,
     changes: &mut Vec<AppliedChange>,
     created_directories: &mut Vec<Destination>,
+    directory_cache: &mut DirectoryCache,
 ) -> Result<()> {
-    let relative = record_path
-        .strip_prefix(root)
-        .context("installed record is outside the target root")?
-        .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/");
-    let destination = resolve_destination(root, &relative, created_directories, true)?;
+    let destination =
+        resolve_destination_with_cache(root, relative, created_directories, true, directory_cache)?;
     let bytes = serde_json::to_vec_pretty(record)?;
     let (staged, mut file) = destination.stage_file()?;
     file.write_all(&bytes)?;
     file.set_permissions(fs::Permissions::from_mode(0o644))?;
     file.sync_all()?;
-    let backup = snapshot_existing(root, &destination, &relative, backup_root)?;
+    let backup = snapshot_existing(root, &destination, relative, backup_root)?;
     staged.persist(&destination)?;
     changes.push(AppliedChange {
         destination,
@@ -850,7 +1170,7 @@ fn ensure_state_directory(root: &Path, relative: &str) -> Result<()> {
 }
 
 fn acquire_lock(root: &Path) -> Result<File> {
-    let lock_path = root.join("var/lib/arkup/arkup.lock");
+    let lock_path = root.join(STATE_DIRECTORY).join("arkup.lock");
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -920,6 +1240,462 @@ mod tests {
     use crate::archive::{PackOptions, create_pack};
     use crate::key::generate_keypair;
     use std::os::unix::fs::symlink;
+    use std::process::Command;
+
+    #[test]
+    fn directory_cache_shares_handles_for_the_same_inode() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = DirectoryCache::default();
+        let first = cache.share(File::open(temp.path()).unwrap()).unwrap();
+        let second = cache.share(File::open(temp.path()).unwrap()).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.directories.len(), 1);
+    }
+
+    // Set hard limits only inside a child whose other tests are filtered out.
+    fn fd_test_child(test: &str, hard_limit: libc::rlim_t) -> bool {
+        const CHILD_TEST: &str = "ARKUP_FD_REGRESSION_CHILD";
+        if std::env::var(CHILD_TEST).as_deref() != Ok(test) {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(test)
+                .env(CHILD_TEST, test)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{test} child failed");
+            return false;
+        }
+        let limits = libc::rlimit {
+            rlim_cur: hard_limit,
+            rlim_max: hard_limit,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+        true
+    }
+
+    fn fd_test_pack(temp: &Path, deletions: Vec<String>) -> ApplyOptions {
+        let (_, signing_key, public_key) = generate_keypair(&temp.join("keys")).unwrap();
+        let archive = temp.join("test.aup");
+        create_pack(&PackOptions {
+            source: temp.join("source"),
+            deletions,
+            system_files: Vec::new(),
+            name: "fd-test".into(),
+            version: "1.0".into(),
+            sequence: 1,
+            base_sequence: None,
+            system_update: false,
+            architecture: "any".into(),
+            description: "exercise update directory planning".into(),
+            signing_key,
+            output: archive.clone(),
+        })
+        .unwrap();
+        ApplyOptions {
+            archive,
+            root: temp.join("root"),
+            supplied_key: Some(public_key),
+            architecture: None,
+            allow_downgrade: false,
+        }
+    }
+
+    #[test]
+    fn apply_ignores_missing_delete_parents_in_descriptor_budget() {
+        if !fd_test_child(
+            "install::tests::apply_ignores_missing_delete_parents_in_descriptor_budget",
+            128,
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(temp.path().join("source")).unwrap();
+        fs::create_dir_all(root.join("existing")).unwrap();
+        fs::write(root.join("existing/tool"), b"obsolete").unwrap();
+        let mut deletions: Vec<_> = (0..100)
+            .map(|index| format!("missing-{index:03}/nested/tool"))
+            .collect();
+        deletions.push("existing/tool".into());
+        apply(&fd_test_pack(temp.path(), deletions)).unwrap();
+
+        assert!(!root.join("missing-000").exists());
+        assert!(!root.join("existing/tool").exists());
+        assert!(
+            root.join(INSTALLED_DIRECTORY)
+                .join("fd-test.json")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn apply_budgets_the_record_and_state_before_mutation() {
+        if !fd_test_child(
+            "install::tests::apply_budgets_the_record_and_state_before_mutation",
+            128,
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let root = temp.path().join("root");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(source.join("a-first"), b"replacement").unwrap();
+        fs::write(root.join("a-first"), b"original").unwrap();
+        // Root and payload alone fit into 128 descriptors with the reserve.
+        // Counting the paths needed to set up state and write the record does not.
+        for index in 0..60 {
+            let parent = source.join(format!("dir-{index:03}"));
+            fs::create_dir(&parent).unwrap();
+            fs::write(parent.join("tool"), b"new").unwrap();
+        }
+        let error = apply(&fd_test_pack(temp.path(), Vec::new())).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("process hard limit is 128"),
+            "{error:#}"
+        );
+        assert!(!root.join("var").exists());
+        assert!(!root.join("dir-000").exists());
+        assert_eq!(fs::read(root.join("a-first")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn apply_resolves_alias_into_a_directory_created_by_an_earlier_payload() {
+        for install_alias in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let root = temp.path().join("root");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir_all(source.join("a-real")).unwrap();
+            fs::create_dir_all(source.join("z-alias")).unwrap();
+            fs::write(source.join("a-real/seed"), b"seed").unwrap();
+            fs::write(source.join("z-alias/tool"), b"through alias").unwrap();
+            if install_alias {
+                // The manifest forbids z-alias and z-alias/tool as direct
+                // entries. Install the alias through a distinct logical path.
+                symlink(".", root.join("b-install")).unwrap();
+                fs::create_dir(source.join("b-install")).unwrap();
+                symlink("a-real", source.join("b-install/z-alias")).unwrap();
+            } else {
+                symlink("a-real", root.join("z-alias")).unwrap();
+            }
+            apply(&fd_test_pack(temp.path(), Vec::new())).unwrap();
+            assert_eq!(fs::read(root.join("a-real/seed")).unwrap(), b"seed");
+            assert_eq!(
+                fs::read(root.join("a-real/tool")).unwrap(),
+                b"through alias"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_rejects_unresolved_and_escaping_aliases_before_mutation() {
+        for (target, expected) in [
+            ("missing", "is not a directory"),
+            ("later-real", "is not a directory"),
+            ("../outside", "outside the target root"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let root = temp.path().join("root");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(temp.path().join("outside")).unwrap();
+            fs::create_dir_all(source.join("b-alias")).unwrap();
+            fs::create_dir_all(source.join("later-real")).unwrap();
+            fs::write(source.join("a-first"), b"replacement").unwrap();
+            fs::write(source.join("b-alias/tool"), b"update").unwrap();
+            fs::write(source.join("later-real/seed"), b"too late").unwrap();
+            fs::write(root.join("a-first"), b"original").unwrap();
+            symlink(target, root.join("b-alias")).unwrap();
+
+            let error = apply(&fd_test_pack(temp.path(), Vec::new())).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(fs::read(root.join("a-first")).unwrap(), b"original");
+            assert!(!root.join("var").exists());
+            assert!(!temp.path().join("outside/tool").exists());
+        }
+    }
+
+    #[test]
+    fn rollback_removes_directory_when_retaining_handle_fails() {
+        if !fd_test_child(
+            "install::tests::rollback_removes_directory_when_retaining_handle_fails",
+            (FILE_DESCRIPTOR_RESERVE + 1) as libc::rlim_t,
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut journal = Vec::new();
+        let mut cache = DirectoryCache::with_file_descriptor_limit(FileDescriptorLimit {
+            original: None,
+            already_open: 0,
+        });
+
+        let result =
+            resolve_destination_with_cache(&root, "new/tool", &mut journal, false, &mut cache);
+        assert!(
+            matches!(result, Err(error) if format!("{error:#}").contains("process hard limit"))
+        );
+        assert!(root.join("new").is_dir());
+        rollback(&[], &journal).unwrap();
+        assert!(!root.join("new").exists());
+    }
+
+    #[test]
+    fn apply_reuses_directory_handles_under_a_low_descriptor_limit() {
+        const CHILD_MARKER: &str = "ARKUP_LOW_FD_APPLY_CHILD";
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(OsStr::new("1")) {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "install::tests::apply_reuses_directory_handles_under_a_low_descriptor_limit",
+                ])
+                .env(CHILD_MARKER, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "low-descriptor child test failed");
+            return;
+        }
+
+        let mut limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+            0
+        );
+        assert!(limits.rlim_max >= 64);
+        limits.rlim_cur = 64;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let root = temp.path().join("root");
+        let key_dir = temp.path().join("keys");
+        let package = temp.path().join("many-files.aup");
+        fs::create_dir_all(source.join("usr/bin")).unwrap();
+        for index in 0..1_100 {
+            fs::write(
+                source.join(format!("usr/bin/tool-{index:04}")),
+                b"descriptor-bounded update",
+            )
+            .unwrap();
+        }
+
+        let (key_id, signing_key, public_key) = generate_keypair(&key_dir).unwrap();
+        create_pack(&PackOptions {
+            source,
+            deletions: Vec::new(),
+            system_files: Vec::new(),
+            name: "arkanaos-system".into(),
+            version: "1.0.1".into(),
+            sequence: 2,
+            base_sequence: None,
+            system_update: false,
+            architecture: "any".into(),
+            description: "exercise bounded update descriptors".into(),
+            signing_key,
+            output: package.clone(),
+        })
+        .unwrap();
+        fs::create_dir_all(root.join("etc/arkup/trustedkeys.d")).unwrap();
+        fs::copy(
+            public_key,
+            root.join(format!("etc/arkup/trustedkeys.d/{key_id}.pub")),
+        )
+        .unwrap();
+
+        apply(&ApplyOptions {
+            archive: package,
+            root: root.clone(),
+            supplied_key: None,
+            architecture: Some("x86_64".into()),
+            allow_downgrade: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read(root.join("usr/bin/tool-1099")).unwrap(),
+            b"descriptor-bounded update"
+        );
+        let mut restored_limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut restored_limits) },
+            0
+        );
+        assert_eq!(restored_limits.rlim_cur, 64);
+    }
+
+    #[test]
+    fn apply_expands_descriptor_budget_for_symlink_target_directories() {
+        const CHILD_MARKER: &str = "ARKUP_SYMLINK_FD_APPLY_CHILD";
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(OsStr::new("1")) {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "install::tests::apply_expands_descriptor_budget_for_symlink_target_directories",
+                ])
+                .env(CHILD_MARKER, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "symlink low-descriptor child test failed");
+            return;
+        }
+
+        let mut limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+            0
+        );
+        assert!(limits.rlim_max >= 64);
+        limits.rlim_cur = 64;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let root = temp.path().join("root");
+        let key_dir = temp.path().join("keys");
+        let package = temp.path().join("symlink-target.aup");
+        fs::create_dir_all(source.join("alias")).unwrap();
+        fs::write(source.join("alias/tool"), b"symlink target update").unwrap();
+
+        let target = root.join("real");
+        fs::create_dir_all(&target).unwrap();
+        let mut deep_target = target;
+        for index in 0..96 {
+            deep_target.push(format!("dir-{index:03}"));
+            fs::create_dir(&deep_target).unwrap();
+        }
+        symlink(&deep_target, root.join("alias")).unwrap();
+
+        let (key_id, signing_key, public_key) = generate_keypair(&key_dir).unwrap();
+        create_pack(&PackOptions {
+            source,
+            deletions: Vec::new(),
+            system_files: Vec::new(),
+            name: "arkanaos-system".into(),
+            version: "1.0.1".into(),
+            sequence: 2,
+            base_sequence: None,
+            system_update: false,
+            architecture: "any".into(),
+            description: "exercise symlink target descriptor bounds".into(),
+            signing_key,
+            output: package.clone(),
+        })
+        .unwrap();
+        fs::create_dir_all(root.join("etc/arkup/trustedkeys.d")).unwrap();
+        fs::copy(
+            public_key,
+            root.join(format!("etc/arkup/trustedkeys.d/{key_id}.pub")),
+        )
+        .unwrap();
+
+        apply(&ApplyOptions {
+            archive: package,
+            root: root.clone(),
+            supplied_key: None,
+            architecture: Some("x86_64".into()),
+            allow_downgrade: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read(deep_target.join("tool")).unwrap(),
+            b"symlink target update"
+        );
+        let mut restored_limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut restored_limits) },
+            0
+        );
+        assert_eq!(restored_limits.rlim_cur, 64);
+    }
+
+    #[test]
+    fn apply_preflights_symlink_target_descriptor_budget_before_mutation() {
+        const CHILD_MARKER: &str = "ARKUP_SYMLINK_FD_PREFLIGHT_CHILD";
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(OsStr::new("1")) {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "install::tests::apply_preflights_symlink_target_descriptor_budget_before_mutation",
+                ])
+                .env(CHILD_MARKER, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "symlink preflight child test failed");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let root = temp.path().join("root");
+        let key_dir = temp.path().join("keys");
+        let package = temp.path().join("symlink-target-over-limit.aup");
+        fs::create_dir_all(source.join("alias")).unwrap();
+        fs::write(source.join("a-first"), b"new content").unwrap();
+        fs::write(source.join("alias/tool"), b"symlink target update").unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a-first"), b"original content").unwrap();
+
+        let mut deep_target = root.join("real");
+        fs::create_dir_all(&deep_target).unwrap();
+        for index in 0..96 {
+            deep_target.push(format!("dir-{index:03}"));
+            fs::create_dir(&deep_target).unwrap();
+        }
+        symlink(&deep_target, root.join("alias")).unwrap();
+
+        let (key_id, signing_key, public_key) = generate_keypair(&key_dir).unwrap();
+        create_pack(&PackOptions {
+            source,
+            deletions: Vec::new(),
+            system_files: Vec::new(),
+            name: "arkanaos-system".into(),
+            version: "1.0.1".into(),
+            sequence: 2,
+            base_sequence: None,
+            system_update: false,
+            architecture: "any".into(),
+            description: "reject an unbudgeted symlink target before mutation".into(),
+            signing_key,
+            output: package.clone(),
+        })
+        .unwrap();
+        fs::create_dir_all(root.join("etc/arkup/trustedkeys.d")).unwrap();
+        fs::copy(
+            public_key,
+            root.join(format!("etc/arkup/trustedkeys.d/{key_id}.pub")),
+        )
+        .unwrap();
+
+        let mut limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+            0
+        );
+        assert!(limits.rlim_max >= 128);
+        limits.rlim_cur = 128;
+        limits.rlim_max = 128;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+
+        let error = apply(&ApplyOptions {
+            archive: package,
+            root: root.clone(),
+            supplied_key: None,
+            architecture: Some("x86_64".into()),
+            allow_downgrade: false,
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("process hard limit is 128"));
+        assert_eq!(fs::read(root.join("a-first")).unwrap(), b"original content");
+        assert!(!root.join("var/lib/arkup").exists());
+        assert!(!deep_target.join("tool").exists());
+    }
 
     #[test]
     fn failed_owner_restore_keeps_destination_and_recovery_backup() {
@@ -1852,5 +2628,79 @@ mod tests {
             .find(|path| path.exists())
             .expect("deleted binary should remain in the update backup");
         assert_eq!(fs::read(saved_binary).unwrap(), b"old binary");
+    }
+
+    #[test]
+    fn preflight_counts_descriptors_already_open_before_mutation() {
+        if !fd_test_child(
+            "install::tests::preflight_counts_descriptors_already_open_before_mutation",
+            128,
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let source = temp.path().join("source");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(root.join("a-first"), b"original").unwrap();
+        fs::write(source.join("a-first"), b"replacement").unwrap();
+        for i in 0..25 {
+            fs::create_dir(source.join(format!("dir-{i:02}"))).unwrap();
+            fs::write(source.join(format!("dir-{i:02}/file")), b"new").unwrap();
+        }
+        let options = fd_test_pack(temp.path(), Vec::new());
+        let _held: Vec<_> = (0..40).map(|_| File::open("/dev/null").unwrap()).collect();
+        let error = apply(&options).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("process hard limit is 128"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(root.join("a-first")).unwrap(), b"original");
+        assert!(!root.join("var").exists());
+    }
+
+    #[test]
+    fn config_deletion_projection_matches_later_alias_operations() {
+        for modified in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let source = temp.path().join("source");
+            fs::create_dir_all(root.join("etc")).unwrap();
+            fs::create_dir_all(source.join("etc")).unwrap();
+            fs::write(source.join("etc/old"), b"original").unwrap();
+            let mut options = fd_test_pack(temp.path(), Vec::new());
+            apply(&options).unwrap();
+            if modified {
+                fs::write(root.join("etc/old"), b"modified").unwrap();
+            }
+            symlink("etc", root.join("z-alias")).unwrap();
+            fs::remove_file(source.join("etc/old")).unwrap();
+            options.archive = temp.path().join("second.aup");
+            create_pack(&PackOptions {
+                source,
+                deletions: vec!["etc/old".into(), "z-alias/old/tool".into()],
+                system_files: Vec::new(),
+                name: "fd-test".into(),
+                version: "2.0".into(),
+                sequence: 2,
+                base_sequence: None,
+                system_update: false,
+                architecture: "any".into(),
+                description: "config deletion through an alias".into(),
+                signing_key: options.supplied_key.as_ref().unwrap().with_extension("key"),
+                output: options.archive.clone(),
+            })
+            .unwrap();
+            options.allow_downgrade = false;
+            let result = apply(&options);
+            if modified {
+                assert!(result.is_err());
+                assert_eq!(fs::read(root.join("etc/old")).unwrap(), b"modified");
+            } else {
+                result.unwrap();
+                assert!(!root.join("etc/old").exists());
+            }
+        }
     }
 }
